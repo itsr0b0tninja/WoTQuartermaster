@@ -1,0 +1,223 @@
+# WoTQuartermaster 0.0.7 replay importer - Python 3.12+; standard library only.
+import argparse, hashlib, json, os, re, struct, time
+from pathlib import Path
+text_type=str
+integer_types=(int,)
+def name_text(value):
+    if isinstance(value, bytes) and not isinstance(value, text_type):
+        return value.decode('utf-8', 'replace')
+    return text_type(value)
+
+
+def plain(value, depth=0):
+    if depth > 20:
+        raise ValueError('Data nesting limit')
+    if value is None or isinstance(value, (bool, float) + integer_types):
+        return value
+    if isinstance(value, (text_type, bytes)):
+        return name_text(value)
+    if hasattr(value, '_asdict'):
+        return plain(value._asdict(), depth+1)
+    if isinstance(value, dict):
+        return {name_text(k): plain(v, depth+1) for k, v in value.items()}
+    if isinstance(value, (tuple, list, set, frozenset)):
+        seq = sorted(value, key=lambda x: name_text(x)) if isinstance(value, (set, frozenset)) else value
+        return [plain(v, depth+1) for v in seq]
+    raise TypeError('Unsupported value: ' + type(value).__name__)
+
+
+# Explicitly selected personal result fields; no opponent identities or chat.
+BATTLE_FIELDS = set(('credits originalCredits factualCredits subtotalCredits eventCredits eventCreditsList premiumCredits creditsToDraw creditsPenalty creditsContribution creditsContributionIn creditsContributionOut creditsReplay originalPremSquadCredits premiumCreditsFactor100 premiumPlusCreditsFactor100 appliedPremiumCreditsFactor100 wotPlusProBoostCreditsFactor100 orderCreditsFactor100 xp originalXP factualXP subtotalXP premiumXP eventXP eventXPList dailyXPFactor10 premiumXPFactor100 premiumPlusXPFactor100 appliedPremiumXPFactor100 additionalXPFactor10 orderXPFactor100 freeXP originalFreeXP factualFreeXP subtotalFreeXP premiumFreeXP eventFreeXP eventFreeXPList orderFreeXPFactor100 tmenXP originalTmenXP originalTMenXP factualTMenXP subtotalTMenXP premiumTmenXPFactor100 appliedPremiumTmenXPFactor100 xpByTmen damageDealt damageReceived damageBlockedByArmor damageAssistedRadio damageAssistedTrack damageAssistedStun kills shots directHits directEnemyHits piercings piercingEnemyHits spotted deathReason deathCount mileage lifeTime team typeCompDescr repair autoRepairCost autoLoadCost autoEquipCost autoEquipBoostersCost autoRepair autoLoad autoEquip capturePoints droppedCapturePoints arenaTypeID duration winnerTeam bonusType gameplayType guiType finishReason arenaCreateTime').split())
+
+def result_projection(raw):
+    if not isinstance(raw,dict):
+        raise ValueError('Expected battle results mapping')
+    def project(d):
+        out = {}
+        if not isinstance(d,dict):
+            return out
+        for k,v in d.items():
+            if k in BATTLE_FIELDS:
+                try: out[k]=plain(v)
+                except Exception: pass
+        return out
+    personal=raw.get('personal',{})
+    rows={}
+    if isinstance(personal,dict):
+        for k,v in personal.items():
+            key=name_text(k)
+            if key.isdigit() or key=='avatar':
+                value=project(v)
+                if value: rows[key]=value
+        if not rows and project(personal): rows['unidentified']=project(personal)
+    common=raw.get('common',{})
+    return {'common':project(common),'personal':rows,'bots_present': bool(common['bots']) if isinstance(common,dict) and 'bots' in common else None}
+
+def account_hash(dbid):
+    import hashlib
+    if dbid is None or not name_text(dbid).isdigit() or int(dbid)<=0: return None
+    return hashlib.sha256(('wot-local:'+name_text(dbid)).encode('utf-8')).hexdigest()[:24]
+
+def battle_id_text(value):
+    if value is None or not name_text(value).isdigit() or int(value)<=0: return None
+    return name_text(value)
+
+def battle_mode(data):
+    # Conservative: a mixed/bot match must never be included in pure PvP.
+    code=data.get('common',{}).get('bonusType')
+    if code==46 or data.get('bots_present') is True: return 'ai_or_mixed'
+    if code==1 and data.get('bots_present') is not True: return 'random_pvp'
+    if code in (0, None): return 'unknown'
+    return 'other_mode'
+MAGIC=b'\x12\x32\x34\x11'
+MAX_BLOCK=64*1024*1024
+VERSION='0.0.7'
+
+def parse_replay(path):
+    with path.open('rb') as f:
+        if f.read(4)!=MAGIC: raise ValueError('Unrecognised replay signature')
+        def uint():
+            b=f.read(4)
+            if len(b)!=4: raise ValueError('Truncated replay header')
+            return struct.unpack('<I',b)[0]
+        count=uint()
+        if count not in (1,2): raise ValueError('Unsupported replay block count: %d'%count)
+        def block():
+            size=uint()
+            if size>MAX_BLOCK: raise ValueError('Replay JSON block too large')
+            raw=f.read(size)
+            if len(raw)!=size: raise ValueError('Truncated replay JSON')
+            return json.loads(raw)
+        meta=block()
+        if not isinstance(meta,dict): raise ValueError('Unexpected replay metadata')
+        if count==1: raise ValueError('Replay has no completed results block')
+        results=block()
+        if isinstance(results,list) and results: results=results[0]
+        if not isinstance(results,dict): raise ValueError('Unexpected results format')
+    arena=battle_id_text(results.get('arenaUniqueID'))
+    account=account_hash(meta.get('playerID'))
+    data=result_projection(results)
+    if not arena or not account or not data['personal']: raise ValueError('Missing battle/account identity or personal results')
+    return {'battle_id':arena,'account_key':account,'source':'replay','data':data,'mode':battle_mode(data),'metadata':{k:meta[k] for k in ('playerVehicle','mapName','mapDisplayName','dateTime','clientVersionFromXml','clientVersionFromExe','battleType','gameplayID','regionCode') if k in meta}}
+
+def atomic_json(path,obj):
+    path.parent.mkdir(parents=True,exist_ok=True)
+    tmp=path.with_suffix(path.suffix+'.tmp')
+    with tmp.open('w',encoding='utf-8') as f:
+        json.dump(obj,f,ensure_ascii=True,allow_nan=False,sort_keys=True,indent=2)
+        f.flush(); os.fsync(f.fileno())
+    os.replace(tmp,path)
+
+def read_json(path,default):
+    if not path.exists(): return default
+    with path.open(encoding='utf-8') as f: return json.load(f)
+
+def journal(path,issues):
+    if not path.exists(): return
+    with path.open('rb') as f:
+        for i,line in enumerate(f,1):
+            try:
+                r=json.loads(line)
+                if isinstance(r,dict): yield r
+                else: raise ValueError('Not an object')
+            except (ValueError,UnicodeError): issues.append('%s line %d: invalid JSON; skipped'%(path.name,i))
+
+def fingerprint(data):
+    return hashlib.sha256(json.dumps(data,ensure_ascii=True,sort_keys=True,allow_nan=False).encode('ascii')).hexdigest()
+
+def identity(r):
+    account=r.get('account_key'); arena=battle_id_text(r.get('battle_id'))
+    if not arena or not isinstance(account,str) or not re.fullmatch('[0-9a-f]{24}',account): return None
+    return account+':'+arena
+
+def reconcile(replays,history,issues):
+    battles={}
+    def add(r,source):
+        key=identity(r)
+        if not key:
+            issues.append('Unlinked %s record: missing reliable account or battle ID'%source); return
+        if not isinstance(r.get('data'),dict): return
+        entry=battles.setdefault(key,{'account_key':r['account_key'],'battle_id':str(r['battle_id']),'sources':{},'configuration_candidates':[]})
+        record={'data':r['data'],'metadata':r.get('metadata',{}),'mode':r.get('mode') or battle_mode(r['data'])}
+        if r.get('recorded_at') is not None: record['recorded_at']=r['recorded_at']
+        revisions=entry['sources'].setdefault(source,[])
+        if not any(fingerprint(x['data'])==fingerprint(record['data']) and x.get('metadata')==record['metadata'] for x in revisions): revisions.append(record)
+    for r in replays.values(): add(r,'replay')
+    for r in journal(history/'battle_results.jsonl',issues): add(r,'connector')
+    for r in journal(history/'configurations.jsonl',issues):
+        key=identity(r)
+        if r.get('kind')=='battle_start_candidate' and key in battles:
+            item={k:r.get(k) for k in ('configuration','configuration_status','avatar_vehicle_id')}
+            if item not in battles[key]['configuration_candidates']: battles[key]['configuration_candidates'].append(item)
+    for entry in battles.values():
+        sources=entry['sources']; c=sources.get('connector',[]); r=sources.get('replay',[])
+        # Prefer latest client revision for overlapping fields, but retain both originals.
+        merged={'common':{},'personal':{},'bots_present':None}; conflicts=[]
+        for source,rows in [('replay',r),('connector',c)]:
+            if not rows: continue
+            data=rows[-1]['data']
+            for k,v in data.get('common',{}).items():
+                if k in merged['common'] and merged['common'][k]!=v: conflicts.append('common.'+k)
+                if v is not None: merged['common'][k]=v
+            for vid,stats in data.get('personal',{}).items():
+                if not isinstance(stats,dict): continue
+                dest=merged['personal'].setdefault(str(vid),{})
+                for k,v in stats.items():
+                    if k in dest and dest[k]!=v: conflicts.append('personal.%s.%s'%(vid,k))
+                    if v is not None: dest[k]=v
+            if data.get('bots_present') is not None: merged['bots_present']=data['bots_present']
+        entry['data']=merged; entry['conflicts']=sorted(set(conflicts)); entry['mode']=battle_mode(merged)
+        entry['metadata']=r[-1]['metadata'] if r else {}
+        if any(x.get('mode')=='ai_or_mixed' for x in c+r): entry['mode']='ai_or_mixed'
+        if entry['conflicts']: entry['status']='source_conflict'
+        else: entry['status']='linked' if c and r else 'single_source'
+    return battles
+
+def scan(replay_dir,data_dir):
+    history=data_dir/'history'; history.mkdir(parents=True,exist_ok=True)
+    replay_path=history/'replay_results.json'; index_path=history/'replay_index.json'
+    replays=read_json(replay_path,{'schema':1,'records':{}})['records']
+    index=read_json(index_path,{'schema':1,'files':{}})['files']
+    issues=[]; imported=0; skipped=0; pending=0
+    for path in sorted(replay_dir.rglob('*.wotreplay')):
+        try:
+            stat=path.stat(); key=str(path.resolve()); stamp=[stat.st_size,stat.st_mtime_ns]
+            old=index.get(key,{})
+            if old.get('stamp')==stamp and old.get('status')=='ok' and old.get('battle_key') in replays: skipped+=1; continue
+            result=parse_replay(path)
+            after=path.stat()
+            if (after.st_size,after.st_mtime_ns)!=tuple(stamp): raise ValueError('Replay still being written')
+            bid=identity(result)
+            # Same battle identity counts once, even if the file was copied/renamed.
+            if bid not in replays: imported+=1
+            # Keep the first complete replay. Different data is flagged rather than replaced.
+            if bid in replays and replays[bid]['data']!=result['data']:
+                issues.append('Different replay result for '+bid+'; retained original')
+                continue
+            replays.setdefault(bid,result)
+            index[key]={'stamp':stamp,'status':'ok','battle_key':bid}
+        except (OSError,ValueError,KeyError,TypeError,struct.error) as e:
+            pending+=1; issues.append('%s: %s'%(path.name,e))
+    # Write results before index so interrupted scans can safely retry.
+    atomic_json(replay_path,{'schema':1,'records':replays})
+    atomic_json(index_path,{'schema':1,'files':index})
+    battles=reconcile(replays,history,issues)
+    atomic_json(history/'unified_battles.json',{'schema':1,'records':battles,'issues':issues,'generated_at':time.time()})
+    report={'new_replays':imported,'unchanged_files':skipped,'incomplete_or_unsupported':pending,'unique_replay_battles':len(replays),'unique_combined_battles':len(battles),'linked_battles':sum(len(x['sources'])==2 for x in battles.values()),'conflicting_battles':sum(bool(x['conflicts']) for x in battles.values()),'issues':issues}
+    atomic_json(history/'replay_import_status.json',report)
+    print(json.dumps(report,indent=2)); return report
+
+def main():
+    p=argparse.ArgumentParser(description='WoTQuartermaster 0.0.7 local replay importer')
+    p.add_argument('--replays',type=Path,default=Path(r'C:\Games\World_of_Tanks_EU\replays'))
+    p.add_argument('--data',type=Path,default=Path(__file__).resolve().parent/'data')
+    p.add_argument('--watch',action='store_true',help='Scan every 30 seconds until Ctrl+C')
+    args=p.parse_args()
+    if not args.replays.is_dir(): p.error('Replay directory does not exist: '+str(args.replays))
+    try:
+        while True:
+            scan(args.replays,args.data)
+            if not args.watch: break
+            time.sleep(30)
+    except KeyboardInterrupt: print('Stopped.')
+if __name__=='__main__': main()

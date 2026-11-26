@@ -1,0 +1,23 @@
+# User-specific configuration and exported game data
+connector.ini
+data/
+*.wotreplay
+*.dds
+*.jsonl
+diagnostics*.json
+battle_context.json
+connector.json
+replay_import_status.json
+unified_battles.json
+*.log
+# Python and local build outputs
+__pycache__/
+*.pyc
+*.wotmod
+wot_connector_*/
+*.tmp
+*.bak
+.venv/
+venv/
+build/
+dist/
