@@ -1,0 +1,61 @@
+name: Publish Connector 0.0.8
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/connector-release.yml'
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: connector-release-0.0.8
+  cancel-in-progress: false
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify tested source and build with CPython 2.7.18
+        shell: bash
+        run: |
+          test "$(git hash-object connector/WoT_Companion_Connector_v0.0.8_source.txt)" = "6871f8cf322641dc6fcee467d374bef70a2f9b8b"
+          test "$(git hash-object connector/Build_WoT_Connector_v0.0.8.txt)" = "bdb0b6ce4e72bef299504e58fcc54da6dde7741b"
+          docker run --rm --user "$(id -u):$(id -g)" -v "$PWD/connector:/work" -w /work python:2.7.18 python Build_WoT_Connector_v0.0.8.txt
+      - name: Validate archive and prepare release assets
+        shell: bash
+        run: |
+          mkdir -p release-assets
+          cp connector/wot_companion_connector.wotmod release-assets/
+          cp connector/connector.ini.example release-assets/connector.ini
+          python3 - <<'PY'
+          from pathlib import Path
+          import zipfile
+          path = Path('release-assets/wot_companion_connector.wotmod')
+          with zipfile.ZipFile(path) as archive:
+              assert archive.testzip() is None
+              expected = 'res/scripts/client/gui/mods/mod_wot_companion_connector.pyc'
+              assert archive.namelist() == [expected]
+              code = archive.read(expected)
+              assert code[:4] == bytes.fromhex('03f30d0a')
+              assert b'0.0.8' in code and b'battle_context.json' in code and b'connector.ini' in code
+          PY
+          cd release-assets
+          sha256sum wot_companion_connector.wotmod > wot_companion_connector.sha256.txt
+      - name: Publish development prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          if gh release view connector-v0.0.8 >/dev/null 2>&1; then
+            echo "Release already exists; leaving existing assets unchanged."
+            exit 0
+          fi
+          gh release create connector-v0.0.8 \
+            --target "$GITHUB_SHA" \
+            --title "WoTQuartermaster Connector v0.0.8" \
+            --prerelease \
+            --notes "Initial compiled development prerelease, built by GitHub Actions from the exact source and build helper tested on World of Tanks EU 2.4.2.0. Includes live map/team/vehicle context and local garage and battle data. Close the game, edit connector.ini to point to an existing absolute data directory, and copy both the mod and INI into the active game-version mods folder. The desktop advisor is not yet released. This CI-produced binary has passed archive and bytecode checks but has not itself been tested in the game." \
+            release-assets/wot_companion_connector.wotmod \
+            release-assets/connector.ini \
+            release-assets/wot_companion_connector.sha256.txt
