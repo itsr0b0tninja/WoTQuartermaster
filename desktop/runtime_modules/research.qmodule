@@ -1,0 +1,73 @@
+from module_runtime import ModuleUnavailable
+import hashlib, json, logging, time, io
+from pathlib import Path
+from module_shared import obj, seq, key, num, display, money, name
+MODULE={'id':'research','version':'0.1.0','api':1,'min_core':'0.3.1','dependencies':{}}
+MODULES={'chassis':('Suspension','chassis','CHASSIS'),'turret':('Turret','turrets','TURRET'),'gun':('Gun','guns','GUN'),'engine':('Engine','engines','ENGINE'),'radio':('Radio','radios','RADIO'),'fuelTank':('Fuel tank','', 'FUEL_TANK')}
+
+def edge_rows(self,v):
+    path=obj(obj(self.section('progression')).get('owned_vehicle_paths')).get(key(v.get('invID')))
+    if not isinstance(path,dict) or key(path.get('vehicle_id'))!=key(v.get('intCD')): return []
+    return [e for e in seq(path.get('edges')) if isinstance(e,dict) and e.get('target_id') is not None]
+
+def modules(self,v):
+    mounted=obj(v.get('modules')); static=self.catalogue.item('vehicles',v.get('intCD')); compat=obj(static.get('compatible_modules'))
+    unlocked=obj(self.section('research')).get('unlocked_module_ids')
+    initial=obj(self.section('research')).get('initial_unlocks')
+    known=isinstance(unlocked,list)
+    ids=set(map(key,seq(unlocked)))|set(map(key,seq(initial)))
+    edges={key(e['target_id']):e for e in self.edge_rows(v)}
+    tg=[x for x in seq(compat.get('turrets_and_guns')) if isinstance(x,dict)]
+    options={'chassis':seq(compat.get('chassis')),'engine':seq(compat.get('engines')),'radio':seq(compat.get('radios')),'fuelTank':seq(compat.get('fuelTanks')),'turret':[x.get('turret') for x in tg],'gun':[i for x in tg for i in seq(x.get('guns'))]}
+    current_turret=key(obj(mounted.get('turret')).get('intCD')); current_gun=key(obj(mounted.get('gun')).get('intCD'))
+    out=[]
+    for role,(title,cat,depot) in MODULES.items():
+        current=obj(mounted.get(role)); cid=key(current.get('intCD'))
+        candidates=list(dict.fromkeys(([cid] if cid else [])+[key(i) for i in options.get(role,[]) if i is not None]))
+        if not candidates: out.append((title,'Unknown','Not reported','Unknown','Unknown','Unknown','Unknown')); continue
+        for i in candidates:
+            e=obj(edges.get(i)); target=obj(e.get('target')); base=self.catalogue.item(cat,i)
+            owned=self.inventory(depot,i)
+            if i==cid: status='Mounted'
+            elif e.get('unlocked') is True or e.get('default_unlock') is True or i in ids: status='Researched'
+            elif e.get('unlocked') is False or known: status='Locked prerequisites' if False in obj(e.get('prerequisite_unlocked')).values() else 'Research available' if e and all(x is True for x in obj(e.get('prerequisite_unlocked')).values()) else 'Not researched'
+            else: status='Research unknown'
+            fit='Mounted' if i==cid else 'Vehicle-compatible; fitting not tested'
+            if role=='gun' and current_turret and tg and not any(key(x.get('turret'))==current_turret and i in map(key,seq(x.get('guns'))) for x in tg): fit='Requires another turret'
+            if role=='turret' and current_gun and tg and not any(key(x.get('turret'))==i and current_gun in map(key,seq(x.get('guns'))) for x in tg): fit='Requires another gun'
+            item=current if i==cid else target or base
+            out.append((title,name(item,'ID '+i),status,display(owned),display(e.get('xp_raw')),self.price(cat,i,target or self.depot_detail(depot,i)),fit))
+    return out
+
+def progression(self,v):
+    out=[]
+    for e in self.edge_rows(v):
+        cd=e['target_id']; target=obj(e.get('target')); cat='vehicles' if target.get('item_type_name')=='vehicle' or target.get('tier') is not None else ''
+        status='Researched' if e.get('unlocked') is True or e.get('default_unlock') is True else 'Locked prerequisites' if False in obj(e.get('prerequisite_unlocked')).values() else 'Available to research' if e.get('unlocked') is False and isinstance(e.get('prerequisite_unlocked'),dict) and all(x is True for x in e['prerequisite_unlocked'].values()) else 'Unknown'
+        price=money(target.get('personal_discount_price')) if isinstance(target.get('personal_discount_price'),dict) and any(num(x) for x in target['personal_discount_price'].values()) else self.price(cat,cd,target)
+        out.append((name(target,name(self.catalogue.item(cat,cd),'ID '+key(cd))), 'Vehicle' if cat else target.get('item_type_name') or 'Module / unknown',status,display(e.get('xp_raw')),display(target.get('blueprint_adjusted_xp')),price,display(e.get('prerequisite_ids'))))
+    return out
+
+def make_progression(self):
+    w,l=page(); heading(l,'Progression','Recorded direct research paths; purchase decisions are deferred to v0.6.0')
+    self.research_note=label('Waiting for research information','Subheading',True); l.addWidget(self.research_note)
+    self.research_table=self.data_table(['From vehicle','Target','Type','Status','Raw XP','Blueprint XP','Purchase price','Prerequisite IDs'])
+    l.addWidget(self.research_table,1); self.add_page('Progression',w)
+
+def render_progression(self,force=False):
+    if not self.model: return
+    g=self.model.garage_data
+    stamp=(self.model.garage_signature,g.catalogue.identity)
+    if not force and stamp==self.research_view_stamp: return
+    self.research_view_stamp=stamp
+    rows=[(v.get('userName') or inv,*row) for inv,v in g.vehicles.items() for row in g.progression(v)]
+    self.set_rows(self.research_table,rows)
+    self.research_note.setText('Progression snapshot: '+g.status('progression')+' · Direct edges only; no buying, selling or spending advice yet.')
+
+
+def refresh_view(self,force=False):
+    if self.stack.currentWidget()==self.pages.get('Progression'): self.render_progression(force)
+def reset_view(self): self.research_view_stamp=None
+
+def register():
+    return {'services':{"edge_rows":edge_rows,"modules":modules,"progression":progression},'views':{"make_progression":make_progression,"render_progression":render_progression},'pages':[{'name':"Progression",'order':40,'build':make_progression}],'tabs':[{ 'group':'vehicle','title':"Modules",'order':20,'headers':["Module","Item","Research status","Depot count","Raw XP","Purchase price","Fit"],'service':'modules','note':"Research and ownership are separate. Alternative fitting is not fully simulated." },{ 'group':'vehicle','title':"Research",'order':70,'headers':["Target","Type","Status","Raw XP","Blueprint XP","Purchase price","Prerequisite IDs"],'service':'progression','note':"Raw direct-edge XP and blueprint-adjusted XP where reported; not a complete path cost." }],'hooks':{'refresh':refresh_view,'reset':reset_view},'factories':{}}

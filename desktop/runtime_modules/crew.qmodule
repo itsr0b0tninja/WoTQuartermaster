@@ -1,0 +1,60 @@
+from module_runtime import ModuleUnavailable
+import hashlib, json, logging, time, io
+from pathlib import Path
+from module_shared import obj, seq, key, num, display, money, name
+MODULE={'id':'crew','version':'0.1.0','api':1,'min_core':'0.3.1','dependencies':{}}
+
+def perk_name(self,s):
+    n=obj(s).get('name')
+    if not n: return 'Unknown perk'
+    return name(self.catalogue.item('crew_perks',n,True),name(self.catalogue.item('crew_perks',n),n))
+
+def crew_slots(self,c):
+    primary=c.get('role') or 'Unknown role'; skills=c.get('skills'); out=[]
+    free_names=set(seq(c.get('freeSkillsNames')))
+    for i,s in enumerate(seq(skills)):
+        level=obj(s).get('level')
+        out.append((primary,'Primary '+str(i+1),self.perk_name(s),display(level)+'%' if num(level) else 'Unknown','Trained' if num(level) and level>=100 else 'Training' if num(level) else 'Unknown'))
+    available=c.get('newSkillsCount'); available=available[0] if isinstance(available,list) and available and type(available[0]) is int else None
+    maxslots=c.get('maxSkillsCount')
+    if isinstance(skills,list) and type(maxslots) is int and 0<=maxslots<=30:
+        for i in range(len(skills),maxslots):
+            status='Unknown' if available is None else 'Available to select' if i-len(skills)<available else 'Locked'
+            out.append((primary,'Primary '+str(i+1),'—','—',status))
+    elif not isinstance(skills,list): out.append((primary,'Primary','Unknown','Unknown','Unavailable'))
+    bonus=obj(c.get('bonus_skills')); roles=list(dict.fromkeys([r for r in seq(c.get('combinedRoles')) if r!=primary]+list(bonus)))
+    for role in roles:
+        values=bonus.get(role); levels=c.get('bonusSlotsLevels'); count=obj(c.get('newBonusSkillsCountByRole')).get(role)
+        remaining=count if type(count) is int else None
+        for i in range(3):
+            s=values[i] if isinstance(values,list) and i<len(values) else None
+            if isinstance(s,dict):
+                level=s.get('level'); status='Trained' if num(level) and level>=100 else 'Training' if num(level) else 'Unknown'
+                out.append((role,'Bonus '+str(i+1),self.perk_name(s),display(level)+'%' if num(level) else 'Unknown',status))
+            else:
+                if not isinstance(values,list) or i>=len(values): status='Unknown'
+                elif isinstance(levels,list) and i<len(levels) and levels[i] is None: status='Locked'
+                elif remaining is not None and remaining>0: status='Available to select'; remaining-=1
+                elif isinstance(levels,list) and i<len(levels) and num(levels[i]): status='Unselected'
+                else: status='Unknown'
+                out.append((role,'Bonus '+str(i+1),'—','—',status))
+    return out
+
+def crew(self,v):
+    rows=[]; crew=obj(self.section('crew'))
+    for slot in seq(v.get('crew_slots')):
+        sid=obj(slot).get('crew_id'); c=obj(crew.get(key(sid)))
+        if not c or key(c.get('vehicleInvID'))!=key(v.get('invID')):
+            rows.append(('Slot '+display(obj(slot).get('slot')),'—','—','—','—','Empty' if sid is None else 'Unavailable')); continue
+        title=c.get('fullUserName') or ('Crew '+key(sid))
+        rows.append((title,'Qualification',display(c.get('combinedRoles')),display(c.get('roleLevel'))+'%' if num(c.get('roleLevel')) else 'Unknown','Efficiency '+display(c.get('currentVehicleSkillsEfficiency')),'Crew XP '+display(c.get('free_crew_xp'))))
+        rows.extend((title,*r) for r in self.crew_slots(c))
+        if c.get('freeSkillsNames'): rows.append((title,'Free perks',display(c['freeSkillsNames']),'—','—','Recorded'))
+    return rows
+
+def barracks(self):
+    return [(c.get('fullUserName') or 'Crew '+i,display(c.get('combinedRoles')),display(c.get('roleLevel')),display(c.get('free_crew_xp'))) for i,c in obj(self.section('crew')).items() if isinstance(c,dict) and c.get('isInTank') is False and c.get('isDismissed') is False]
+
+
+def register():
+    return {'services':{"perk_name":perk_name,"crew_slots":crew_slots,"crew":crew,"barracks":barracks},'views':{},'pages':[],'tabs':[{ 'group':'vehicle','title':"Crew",'order':30,'headers':["Crew member","Role","Slot / roles","Perk / level","Progress","Status"],'service':'crew','note':"All reported primary and secondary slots. Unknown means not verified." }],'hooks':{},'factories':{}}

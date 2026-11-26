@@ -1,0 +1,62 @@
+# Actual compiled Windows helper test, isolated CI fixture. No game installation touched.
+import hashlib, json, os, secrets, shutil, subprocess, sys, tempfile, time
+from pathlib import Path
+
+def digest(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+def run():
+    old=Path(sys.argv[1]).resolve()
+    new=Path(sys.argv[2]).resolve()
+    if digest(old)!='71efa8af23dc743ac0bd3e09c72a1edc2a3d39952b6cb7759ab737ecb76f48ef':
+        raise RuntimeError('Previous release checksum mismatch')
+    with tempfile.TemporaryDirectory(prefix='wot-update-ci-') as tmp:
+        base=Path(tmp); updates=base/'updates'; staging=updates/'staging'; staging.mkdir(parents=True)
+        target=base/'WoTQuartermaster.exe'; shutil.copyfile(old,target)
+        data=base/'data'; data.mkdir(); (data/'sentinel.txt').write_text('preserve game data')
+        settings=base/'settings.ini'
+        settings.write_text('[Desktop]\nplaystyle = Passive scout\nupdate_checks = no\n')
+        env=os.environ.copy(); env['QT_QPA_PLATFORM']='offscreen'; env['PYINSTALLER_RESET_ENVIRONMENT']='1'
+        def stop_fixture():
+            subprocess.run(['taskkill','/IM','WoTQuartermaster.exe','/T','/F'],capture_output=True,timeout=20)
+            time.sleep(2)
+        def apply(payload,old_version,version):
+            token=secrets.token_hex(16)
+            runner=updates/('runner-'+token+'.exe')
+            shutil.copyfile(target,runner)
+            shutil.copyfile(payload,staging/'WoTQuartermaster.exe')
+            # A real Windows process exits while the helper waits on its PID.
+            # This exercises executable replacement and startup health, not UI clicks.
+            parent=subprocess.Popen([sys.executable,'-c','import time; time.sleep(4)'])
+            request=dict(token=token,parent=parent.pid,old_version=old_version,version=version,size=payload.stat().st_size,sha256=digest(payload))
+            (updates/('request-'+token+'.json')).write_text(json.dumps(request))
+            helper=subprocess.Popen([str(runner),'--apply-update',token,str(parent.pid)],cwd=base,env=env)
+            try:
+                parent.wait(timeout=15)
+                rc=helper.wait(timeout=145)
+                result=json.loads((updates/'update-result.json').read_text())
+                print('Real helper '+old_version+' -> '+version+': '+str(result),flush=True)
+                if rc!=0 or result.get('status')!='success' or result.get('version')!=version:
+                    raise RuntimeError('Compiled helper failed')
+                assert digest(target)==digest(payload)
+                assert (data/'sentinel.txt').read_text()=='preserve game data'
+                assert 'Passive scout' in settings.read_text()
+                assert not (staging/'WoTQuartermaster.exe').exists()
+            finally:
+                if helper.poll() is None: helper.kill(); helper.wait(timeout=10)
+                stop_fixture()
+        try:
+            apply(new,'0.3.0','0.3.1')
+            assert digest(updates/'backups'/'WoTQuartermaster.previous.exe')==digest(old)
+            assert {p.stem for p in (base/'modules').glob('*.qmodule')}=={'garage','inventory','crew','research','maps'}
+            assert not list((base/'modules').glob('.qm-*.tmp'))
+            # Use the new helper to restore the original verified previous EXE.
+            previous=base/'restore-source.exe'
+            shutil.copyfile(updates/'backups'/'WoTQuartermaster.previous.exe',previous)
+            apply(previous,'0.3.1','0.3.0')
+            assert digest(updates/'backups'/'WoTQuartermaster.previous.exe')==digest(new)
+        finally:
+            stop_fixture()
+    print('Real compiled Windows replacement, restart health, backup and reverse replacement passed')
+
+if __name__=='__main__': run()

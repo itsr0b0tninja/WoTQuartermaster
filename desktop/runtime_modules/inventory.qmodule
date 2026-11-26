@@ -1,0 +1,120 @@
+from module_runtime import ModuleUnavailable
+import hashlib, json, logging, time, io
+from pathlib import Path
+from module_shared import obj, seq, key, num, display, money, name
+MODULE={'id':'inventory','version':'0.1.0','api':1,'min_core':'0.3.1','dependencies':{}}
+DEPOT={'CHASSIS':'chassis','TURRET':'turrets','GUN':'guns','ENGINE':'engines','FUEL_TANK':'','RADIO':'radios','OPTIONALDEVICE':'equipment','SHELL':'ammunition','EQUIPMENT':'consumables','BATTLE_BOOSTER':'boosters','CREW_BOOKS':'crew_books','CREW_SKINS':'','CUSTOMIZATION':'','DEMOUNT_KIT':'','RECERTIFICATION_FORM':'','MENTORING_LICENSE':'','LOOT_BOX':''}
+DEPOT_LABEL={'CHASSIS':'Suspension','TURRET':'Turrets','GUN':'Guns','ENGINE':'Engines','FUEL_TANK':'Fuel tanks','RADIO':'Radios','OPTIONALDEVICE':'Equipment','SHELL':'Ammunition','EQUIPMENT':'Consumables','BATTLE_BOOSTER':'Battle boosters','CREW_BOOKS':'Crew books','CREW_SKINS':'Crew skins','CUSTOMIZATION':'Customization','DEMOUNT_KIT':'Demounting kits','RECERTIFICATION_FORM':'Recertification forms','MENTORING_LICENSE':'Mentoring licenses','LOOT_BOX':'Loot boxes'}
+
+def inventory(self,cat,i):
+    stock=obj(self.section('depot')).get(cat)
+    if not isinstance(stock,dict): return None
+    v=stock.get(key(i),0)
+    return v if num(v) and v>=0 else None
+
+def depot_detail(self,cat,i): return obj(obj(obj(self.section('depot_details')).get(cat)).get(key(i))).get('item')
+
+def price(self,cat,i,account_item=None):
+    r=obj(account_item)
+    if isinstance(r.get('buy'),dict) and any(num(x) for x in r['buy'].values()): return money(r['buy'])+' (snapshot)'
+    # Shop table shape is preserved for future pricing. Do not infer currencies
+    # from unlabelled arrays or replace absent dynamic values with zero.
+    p=obj(obj(self.section('current_shop_prices')).get('prices')).get(key(i))
+    if isinstance(p,dict):
+        for field in ('buy','price'):
+            if isinstance(p.get(field),dict) and any(num(x) for x in p[field].values()): return money(p[field])+' (snapshot)'
+        if any(num(p.get(k)) for k in ('credits','gold','crystal')): return money(p)+' (snapshot)'
+    static=self.catalogue.item(cat,i).get('default_buy')
+    return money(static)+' (catalogue default)' if isinstance(static,dict) and any(num(x) for x in static.values()) else 'Unknown'
+
+def equipment(self,v):
+    rows=[]; fitted=v.get('optDevices')
+    cfg=obj(obj(self.section('configured_performance')).get(key(v.get('invID'))))
+    if key(cfg.get('vehicle_id'))!=key(v.get('intCD')): cfg={}
+    categories={key(obj(x).get('index')):obj(obj(x).get('slot')).get('categories') for x in seq(cfg.get('equipment_slots'))}
+    fit=obj(obj(self.section('equipment_compatibility')).get(key(v.get('invID'))))
+    if key(fit.get('vehicle_id'))!=key(v.get('intCD')): fit={}
+    costs=obj(self.section('equipment_removal_costs'))
+    for i,x in enumerate(seq(fitted)):
+        cd=obj(x).get('intCD')
+        rows.append(('Slot '+str(i+1),name(x,'Empty' if x is None else 'Unknown'), 'Mounted' if x else 'Empty',display(categories.get(key(i))),display(self.inventory('OPTIONALDEVICE',cd)) if cd is not None else '—',money(costs.get(key(cd))), '—'))
+    if not isinstance(fitted,list): rows.append(('Slots','Unknown','Unavailable','—','—','—','—'))
+    for cd,e in obj(fit.get('equipment')).items():
+        e=obj(e); slots=seq(e.get('slots')); allowed=[str(i+1) for i,x in enumerate(slots) if obj(x).get('allowed') is True]
+        if not allowed and e.get('installed') is not True: continue
+        item=self.catalogue.item('equipment',cd); transfers=[name(other) for other in self.vehicles.values() if other is not v and any(key(obj(x).get('intCD'))==cd for x in seq(other.get('optDevices')))]
+        rows.append(('Compatible',name(item,'ID '+cd),'Mounted' if e.get('installed') is True else 'Allowed slots '+', '.join(allowed),'Current fit only',display(self.inventory('OPTIONALDEVICE',cd)),money(costs.get(cd)),self.price('equipment',cd,self.depot_detail('OPTIONALDEVICE',cd))+(' · mounted on '+', '.join(transfers) if transfers else '')))
+    return rows
+
+def ammunition(self,v):
+    gun=obj(obj(v.get('modules')).get('gun')).get('intCD')
+    shots=seq(self.catalogue.item('guns',gun,True).get('shots'))
+    shots_by={key(obj(x).get('shell_id')):obj(x) for x in shots if obj(x).get('shell_id') is not None}
+    load=v.get('shells_layout'); installed=v.get('shells')
+    # Explicit layout counts take precedence, including zero; unknown remains unknown.
+    counts={key(obj(x).get('intCD')):obj(x).get('count') for x in seq(installed) if obj(x).get('intCD') is not None}
+    counts.update({key(obj(x).get('intCD')):obj(x).get('count') for x in seq(load) if obj(x).get('intCD') is not None})
+    ids=list(dict.fromkeys(list(shots_by)+list(counts)+[key(i) for i in seq(self.catalogue.item('guns',gun).get('shell_ids'))]))
+    out=[]
+    kinds={'ARMOR_PIERCING':'AP','ARMOR_PIERCING_CR':'APCR','HIGH_EXPLOSIVE':'HE','HOLLOW_CHARGE':'HEAT'}
+    for cd in ids:
+        item=self.catalogue.item('ammunition',cd); p=obj(item.get('parameters')); shot=shots_by.get(cd,{})
+        kind=obj(item.get('descriptor_fields')).get('kind') or item.get('type')
+        pen=shot.get('piercingPower')
+        out.append((name(item,next((name(x,'ID '+cd) for x in seq(installed) if key(obj(x).get('intCD'))==cd),'ID '+cd)),kinds.get(kind,kind or 'Unknown'),display(counts.get(cd)),display(p.get('avgDamage')),display(pen if pen is not None else p.get('avgPiercingPower')),display(shot.get('speed')),display(self.inventory('SHELL',cd)),self.price('ammunition',cd,self.depot_detail('SHELL',cd))))
+    return out
+
+def consumables(self,v):
+    rows=[]
+    for i,x in enumerate(seq(v.get('consumables'))):
+        cd=obj(x).get('intCD'); rows.append((str(i+1),name(x,'Empty' if x is None else 'Unknown'),display(self.inventory('EQUIPMENT',cd)) if cd is not None else '—',self.price('consumables',cd,self.depot_detail('EQUIPMENT',cd)) if cd is not None else '—'))
+    return rows
+
+def depot_rows(self,category=None):
+    stock=obj(self.section('depot')); out=[]
+    for cat,label in DEPOT_LABEL.items():
+        if category and cat!=category: continue
+        data=stock.get(cat)
+        if not isinstance(data,dict): out.append((label,'Unavailable','Unknown','—','—')); continue
+        if not data: out.append((label,'No stock recorded','0','—','—')); continue
+        for cd,count in data.items():
+            detail=obj(self.depot_detail(cat,cd)); item=detail or self.catalogue.item(DEPOT[cat],cd)
+            out.append((label,name(item,'ID '+cd),display(count),self.price(DEPOT[cat],cd,detail),money(detail.get('sell'))))
+    return out
+
+def make_depot(self):
+    w,l=page(); heading(l,'Depot','Account-wide spare stock · mounted items are not added to depot quantities')
+    self.depot_note=label('Waiting for inventory','Subheading',True); l.addWidget(self.depot_note)
+    self.depot_filter=QComboBox(); self.depot_filter.addItem('All categories','')
+    for k,n in DEPOT_LABEL.items(): self.depot_filter.addItem(n,k)
+    self.depot_filter.addItem('Unassigned crew','barracks'); self.depot_filter.addItem('Account resources and reserves','account')
+    self.depot_filter.currentIndexChanged.connect(lambda i:self.render_depot(True)); l.addWidget(self.depot_filter)
+    self.depot_table=self.data_table(['Category','Item','Quantity','Buy price','Sell price']); l.addWidget(self.depot_table,1); self.add_page('Depot',w)
+
+def render_depot(self,force=False):
+    if not self.model or not hasattr(self,'depot_filter'): return
+    g=self.model.garage_data; cat=self.depot_filter.currentData()
+    stamp=(self.model.garage_signature,g.catalogue.identity,cat)
+    if not force and stamp==self.depot_view_stamp: return
+    self.depot_view_stamp=stamp
+    if cat=='barracks':
+        rows=[('Unassigned crew',n,roles,'Qualification '+level,'Crew XP '+xp) for n,roles,level,xp in g.barracks()]
+        if not rows: rows=[('Unassigned crew','No entries reported' if g.status('crew')=='ok' else 'Unavailable','—','—','—')]
+    elif cat=='account':
+        rows=[]
+        for section in ('account_extra','goodies','blueprints','crew_training_costs'):
+            value=g.section(section)
+            if isinstance(value,dict):
+                rows.extend((section,k,display(v),'—','—') for k,v in value.items())
+            else: rows.append((section,'Unavailable','Unknown','—','—'))
+    else: rows=g.depot_rows(cat or None)
+    self.set_rows(self.depot_table,rows)
+    self.depot_note.setText('Depot snapshot: '+g.status('depot')+' · Missing categories are not treated as empty. Prices marked catalogue default are not live discounts.')
+
+
+def refresh_view(self,force=False):
+    if self.stack.currentWidget()==self.pages.get('Depot'): self.render_depot(force)
+def reset_view(self): self.depot_view_stamp=None
+
+def register():
+    return {'services':{"inventory":inventory,"depot_detail":depot_detail,"price":price,"equipment":equipment,"ammunition":ammunition,"consumables":consumables,"depot_rows":depot_rows},'views':{"make_depot":make_depot,"render_depot":render_depot},'pages':[{'name':"Depot",'order':30,'build':make_depot}],'tabs':[{ 'group':'vehicle','title':"Equipment",'order':40,'headers':["Location","Equipment","Fit status","Slot category","Depot count","Removal cost","Buy / other tanks"],'service':'equipment','note':"Fitting checks apply to current configuration only." },{ 'group':'vehicle','title':"Ammo",'order':50,'headers':["Shell","Type","Loaded","Damage","Penetration (mm)","Speed (m/s)","Depot","Buy per shell"],'service':'ammunition','note':"Gun-specific exported penetration values; endpoints not verified." },{ 'group':'vehicle','title':"Consumables",'order':60,'headers':["Slot","Consumable","Depot count","Buy price"],'service':'consumables','note':"Mounted slots and depot stock. Resupply settings are not exported." }],'hooks':{'refresh':refresh_view,'reset':reset_view},'factories':{}}

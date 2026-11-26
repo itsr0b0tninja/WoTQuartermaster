@@ -1,0 +1,187 @@
+from module_runtime import ModuleUnavailable
+import hashlib, json, logging, time, io
+from pathlib import Path
+from module_shared import obj, seq, key, num, display, money, name
+MODULE={'id':'maps','version':'0.1.0','api':1,'min_core':'0.3.1','dependencies':{}}
+def safe_child(root, relative):
+    # Game manifests use Windows separators, even when inspected on Linux.
+    if not isinstance(relative, str) or not relative:
+        raise ValueError('Missing relative path')
+    relative = relative.replace('\\', '/')
+    p = Path(relative)
+    if p.is_absolute() or ':' in relative or '..' in p.parts:
+        raise ValueError('Unsafe catalogue relative path')
+    result = (root / p).resolve()
+    if not result.is_relative_to(root.resolve()):
+        raise ValueError('Path escapes catalogue')
+    return result
+
+
+def read_json(path):
+    with path.open('r', encoding='utf-8-sig') as f:
+        data = json.load(f)
+    if not isinstance(data, dict):
+        raise ValueError('Expected JSON object: ' + path.name)
+    return data
+
+
+def verified_bytes(path, expected):
+    raw = path.read_bytes()
+    if not isinstance(expected, str) or hashlib.sha256(raw).hexdigest() != expected:
+        raise ValueError('Checksum mismatch: ' + path.name)
+    return raw
+
+
+class MapCatalogue:
+    def __init__(self, root):
+        self.root = root / 'catalogue'
+        self.rows = {}
+        self.identity = None
+        self.version = None
+        self.folder = None
+        self.status = 'Map catalogue not loaded'
+        self.stamp = None
+    def load(self, conn, force=False):
+        # Prefer the validated root pointer, not an absolute path from an old PC.
+        pointer_path = self.root / 'manifest.json'
+        try:
+            pointer = read_json(pointer_path)
+            if pointer.get('schema') != 2 or pointer.get('status') != 'complete':
+                raise ValueError('Catalogue pointer not complete')
+            version = pointer.get('game_version')
+            generation = safe_child(self.root, pointer.get('relative_path'))
+            manifest_path = generation / 'manifest.json'
+            enrich = generation / 'enrichment-v1'
+            enrich_path = enrich / 'manifest.json'
+            paths = [pointer_path, manifest_path, generation/'maps.json', enrich_path, enrich/'maps.json']
+            stamp = tuple((str(p), p.stat().st_size, p.stat().st_mtime_ns) if p.is_file() else (str(p), None, None) for p in paths)
+            if not force and stamp == self.stamp:
+                return False
+            self.stamp = stamp
+            manifest = read_json(manifest_path)
+            if manifest.get('status') != 'complete' or manifest.get('schema') != 2 or manifest.get('game_version') != version:
+                raise ValueError('Base catalogue identity mismatch')
+            binfo = obj(obj(manifest.get('files')).get('maps'))
+            base = json.loads(verified_bytes(generation / 'maps.json', binfo.get('sha256')))
+            if base.get('category') != 'maps' or base.get('schema') != 2 or base.get('game_version') != version or len(obj(base.get('rows'))) != binfo.get('count'):
+                raise ValueError('Base map schema/count mismatch')
+            details = {}; einfo = {}; warning = ''
+            try:
+                em = read_json(enrich_path)
+                if em.get('status') not in ('complete', 'partial') or em.get('schema') != 1 or em.get('game_version') != version:
+                    raise ValueError('Enrichment identity mismatch')
+                hashes = {k: v.get('sha256') for k, v in obj(manifest.get('files')).items()}
+                if em.get('base_checksums') != hashes:
+                    raise ValueError('Enrichment belongs to a different catalogue')
+                einfo = obj(obj(em.get('files')).get('maps'))
+                ep = json.loads(verified_bytes(enrich / 'maps.json', einfo.get('sha256')))
+                if ep.get('category') != 'maps' or ep.get('schema') != 1 or ep.get('game_version') != version or ep.get('base_checksums') != hashes or len(obj(ep.get('rows'))) != einfo.get('count'):
+                    raise ValueError('Enriched map schema/count mismatch')
+                details = obj(ep.get('rows'))
+            except (OSError, ValueError, KeyError, TypeError) as exc:
+                warning = ' · Minimap data unavailable: ' + str(exc)
+            self.rows = {str(k): {'base': obj(v), 'detail': obj(details.get(str(k)))} for k, v in obj(base.get('rows')).items()}
+            self.version, self.folder = version, enrich
+            self.identity = [str(generation), version, binfo.get('sha256'), einfo.get('sha256') if details else None]
+            self.status = f'{len(self.rows)} map records · {version}' + warning
+            return True
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            changed = bool(self.rows) or self.status != 'Catalogue unavailable: ' + str(exc)
+            self.rows, self.identity, self.version, self.folder = {}, None, None, None
+            self.stamp = None
+            self.status = 'Catalogue unavailable: ' + str(exc)
+            return changed
+    def resolve(self, context):
+        if not context or self.version != context.get('game_version'):
+            return None
+        key = str(context.get('arena_type_id'))
+        if key in self.rows:
+            base = self.rows[key]['base']
+            if str(base.get('geometryID')) == str(context.get('geometry_id')) and (context.get('gameplay_id') is None or base.get('gameplayID') == context.get('gameplay_id')):
+                return key
+        # Do not silently choose a different variant when geometry is ambiguous.
+        found = [k for k, r in self.rows.items() if r['base'].get('geometryName') == context.get('geometry_name') and r['base'].get('gameplayID') == context.get('gameplay_id')]
+        return found[0] if len(found) == 1 else None
+    def image_png(self, key):
+        from PIL import Image
+        row = self.rows.get(str(key), {})
+        image = obj(obj(row.get('detail')).get('image'))
+        if not image or self.folder is None:
+            raise ValueError('No extracted minimap for this map variant')
+        path = safe_child(self.folder, image.get('file'))
+        raw = verified_bytes(path, image.get('sha256'))
+        if len(raw) != image.get('bytes'):
+            raise ValueError('Minimap size mismatch')
+        with Image.open(io.BytesIO(raw)) as im:
+            im.load()
+            out = io.BytesIO(); im.convert('RGBA').save(out, 'PNG'); return out.getvalue()
+
+
+
+def make_atlas(self):
+    w,l=page(); heading(l,'Map atlas','Browse every extracted map and variant. Tactical overlays are not yet implemented.')
+    self.atlas_status=label('Waiting for catalogue','Subheading',True); l.addWidget(self.atlas_status)
+    split=QSplitter(); self.map_list=QListWidget(); self.map_list.setIconSize(QSize(66,66)); self.map_list.setUniformItemSizes(True); self.map_list.setMinimumWidth(190); self.map_list.currentItemChanged.connect(self.atlas_selection); split.addWidget(self.map_list)
+    right=QWidget(); r=QVBoxLayout(right); self.atlas_name=label('Select a map','Heading',True); r.addWidget(self.atlas_name); self.atlas_info=label('','Subheading',True); r.addWidget(self.atlas_info); self.atlas_img=MapImage(); r.addWidget(self.atlas_img,1); self.atlas_desc=label('',wrap=True); r.addWidget(self.atlas_desc); split.addWidget(right); split.setStretchFactor(1,1); split.setSizes([240,650]); l.addWidget(split,1); self.add_page('Map atlas',w)
+
+def make_battle(self):
+    w,l=page(); self.battle_title=label('Waiting for battle','Heading'); l.addWidget(self.battle_title); self.battle_info=label('No active live battle','Subheading',True); l.addWidget(self.battle_info); self.battle_image=MapImage(); l.addWidget(self.battle_image,1)
+    f,v=panel(); v.addWidget(label('TACTICAL ADVISOR','Subheading')); self.battle_note=label('Static minimap only in this alpha. Position recommendations will be added in v0.8.0.',wrap=True); v.addWidget(self.battle_note); l.addWidget(f); self.add_page('Battle',w)
+
+def render_battle(self):
+    m=self.model; c=m.context
+    if not c:
+        self.battle_title.setText('Waiting for battle map' if m.state in ACTIVE_BATTLE else 'No active battle'); self.battle_info.setText(m.status)
+        if self.last_map!=('none',m.state): self.last_map=('none',m.state); self.battle_image.set_map(message='Waiting for live map information' if m.state in ACTIVE_BATTLE else 'No current battle map')
+        return
+    key=m.catalogue.resolve(c); team=c.get('team') if c.get('team_ready') is True else None; t=m.selected
+    self.battle_title.setText(str(c.get('map_name') or 'Map '+str(c.get('map_id')))); self.battle_info.setText((t.get('name') or 'Vehicle '+str(c.get('vehicle_id') or 'pending'))+'  ·  '+self.settings.values['playstyle']+'  ·  '+('Team '+str(team) if team is not None else 'Waiting for team')+'  ·  '+str(c.get('gameplay_name') or 'Mode pending'))
+    stamp=(c.get('battle_id'),key,str(m.catalogue.identity),self.battle_image.message)
+    if self.last_map and self.last_map[:3]==stamp[:3] and not self.battle_image.pix.isNull(): return
+    if self.last_map and self.last_map[:3]==stamp[:3] and time.monotonic()-getattr(self,'last_map_try',0)<5: return
+    self.last_map=stamp; self.last_map_try=time.monotonic()
+    try:
+        if key is None: raise ValueError('No exact map variant in the matching game catalogue')
+        self.battle_image.set_map(m.catalogue.image_png(key))
+    except (OSError,ValueError,TypeError,ImportError) as exc: self.battle_image.set_map(message=str(exc))
+
+def refresh_atlas(self):
+    if not self.model: return
+    cat=self.model.catalogue; self.atlas_status.setText(cat.status)
+    identity=(str(cat.identity),len(cat.rows))
+    if identity==self.last_atlas: return
+    self.last_atlas=identity; old=self.manual_atlas; self.thumb_queue=[]; self.map_list.clear(); pick=None
+    for key,row in sorted(cat.rows.items(),key=lambda x:(str(x[1]['base'].get('name','')).casefold(),str(x[1]['base'].get('gameplayName','')),x[0])):
+        b=row['base']; name=b.get('name') or b.get('geometryName') or ('Map '+key); item=QListWidgetItem(f'{name}\n{b.get("gameplayName","—")} · {key}'); item.setData(Qt.ItemDataRole.UserRole,key); item.setSizeHint(QSize(180,72)); self.map_list.addItem(item)
+        self.thumb_queue.append((identity,item,key));
+        if key==old: pick=item
+    if pick: self.map_list.setCurrentItem(pick)
+    elif self.map_list.count(): self.map_list.setCurrentRow(0)
+    else: self.atlas_img.set_map(message='No catalogue'); self.atlas_name.setText('No maps available'); self.atlas_info.clear(); self.atlas_desc.clear()
+
+def next_thumbnail(self):
+    if not self.thumb_queue or self.stack.currentWidget()!=self.pages['Map atlas']: return
+    identity,item,key=self.thumb_queue.pop(0)
+    if identity!=self.last_atlas or not self.model: return
+    try:
+        p=QPixmap(); p.loadFromData(self.model.catalogue.image_png(key),'PNG'); item.setIcon(QIcon(p.scaled(66,66,Qt.AspectRatioMode.KeepAspectRatio,Qt.TransformationMode.SmoothTransformation)))
+    except (OSError,ValueError,TypeError,ImportError): pass
+
+def atlas_selection(self,current,previous):
+    if not current or not self.model: return
+    key=current.data(Qt.ItemDataRole.UserRole); self.manual_atlas=key; row=self.model.catalogue.rows.get(key,{})
+    b=obj(row.get('base')); d=obj(row.get('detail')); self.atlas_name.setText(str(b.get('name') or 'Map '+str(key))); self.atlas_info.setText(str(b.get('geometryName','—'))+'  ·  '+str(b.get('gameplayName','—'))+'  ·  Arena '+str(key)+'\nAvailability not verified; catalogue includes special and inactive variants.'); self.atlas_desc.setText(str(b.get('description') or ''))
+    try: self.atlas_img.set_map(self.model.catalogue.image_png(key))
+    except (OSError,ValueError,TypeError,ImportError) as exc: self.atlas_img.set_map(message=str(exc))
+
+
+def refresh_view(self,force=False):
+    self.refresh_atlas()
+    self.render_battle()
+def on_navigate(self,name):
+    if name=='Map atlas': self.refresh_atlas()
+def reset_view(self):
+    self.last_atlas=None; self.last_map=None; self.manual_atlas=None; self.thumb_queue=[]
+
+def register():
+    return {'services':{},'views':{"make_atlas":make_atlas,"make_battle":make_battle,"render_battle":render_battle,"refresh_atlas":refresh_atlas,"next_thumbnail":next_thumbnail,"atlas_selection":atlas_selection},'pages':[{'name':"Map atlas",'order':60,'build':make_atlas},{'name':"Battle",'order':100,'build':make_battle}],'tabs':[],'hooks':{'refresh':refresh_view,'reset':reset_view,'thumbnail':next_thumbnail,'navigate':on_navigate},'factories':{'map_catalogue':MapCatalogue}}
