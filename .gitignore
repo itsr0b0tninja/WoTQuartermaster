@@ -21,3 +21,14 @@ wot_connector_*/
 venv/
 build/
 dist/
+
+# Portable desktop local files
+settings.ini
+logs/
+updates/
+components/
+.build-tools/
+*.exe
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
