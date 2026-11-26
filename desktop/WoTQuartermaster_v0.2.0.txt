@@ -1,0 +1,1109 @@
+# WoTQuartermaster desktop 0.2.0 | portable Windows alpha | Python 3.12+
+# No game control; HTTPS GitHub component updates only; no registry or AppData settings.
+from __future__ import annotations
+import argparse
+import csv
+import queue
+import re
+import secrets
+import subprocess
+import threading
+import urllib.request
+import urllib.parse
+import zipfile
+import configparser
+import hashlib
+import io
+import json
+import logging
+import math
+import os
+from pathlib import Path
+import shutil
+import sqlite3
+import sys
+import time
+from datetime import datetime
+
+VERSION = '0.2.0'
+CONNECTOR_VERSION = '0.0.8'
+DB_SCHEMA = 1
+PLAYSTYLES = ['Passive scout', 'Active scout', 'Hybrid scout', 'Support']
+ACTIVE_BATTLE = {'battle_loading', 'in_battle'}
+BASE = Path(sys.executable if getattr(sys, 'frozen', False) else __file__).resolve().parent
+
+
+def obj(value):
+    return value if isinstance(value, dict) else {}
+
+
+def atomic_text(path, value):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + '.tmp')
+    tmp.write_text(value, encoding='utf-8')
+    os.replace(tmp, path)
+
+
+def absolute(base, value):
+    p = Path(value).expanduser()
+    return (p if p.is_absolute() else base / p).resolve()
+
+
+def safe_child(root, relative):
+    # Game manifests use Windows separators, even when inspected on Linux.
+    if not isinstance(relative, str) or not relative:
+        raise ValueError('Missing relative path')
+    relative = relative.replace('\\', '/')
+    p = Path(relative)
+    if p.is_absolute() or ':' in relative or '..' in p.parts:
+        raise ValueError('Unsafe catalogue relative path')
+    result = (root / p).resolve()
+    if not result.is_relative_to(root.resolve()):
+        raise ValueError('Path escapes catalogue')
+    return result
+
+
+def read_json(path):
+    with path.open('r', encoding='utf-8-sig') as f:
+        data = json.load(f)
+    if not isinstance(data, dict):
+        raise ValueError('Expected JSON object: ' + path.name)
+    return data
+
+
+def verified_bytes(path, expected):
+    raw = path.read_bytes()
+    if not isinstance(expected, str) or hashlib.sha256(raw).hexdigest() != expected:
+        raise ValueError('Checksum mismatch: ' + path.name)
+    return raw
+
+
+def number(value):
+    return f'{value:,}' if isinstance(value, int) and not isinstance(value, bool) else ('—' if value is None else str(value))
+
+
+def age_of(payload, now):
+    try:
+        value = now - float(payload['heartbeat_at'])
+        return max(0., value) if math.isfinite(value) and value >= -5 else float('inf')
+    except (KeyError, ValueError, TypeError, OverflowError):
+        return float('inf')
+
+
+def valid_context(c):
+    return (c.get('schema') == 1 and isinstance(c.get('session'), str) and
+            c.get('connector_version') == CONNECTOR_VERSION and c.get('state') in ACTIVE_BATTLE and
+            c.get('map_ready') is True and c.get('battle_id') is not None and
+            c.get('map_id') is not None)
+
+
+def connection(conn, ctx, conn_disk, ctx_disk, now=None):
+    now = time.time() if now is None else now
+    if not conn:
+        return 'missing', 'Connector missing', None
+    if conn.get('schema') != 1 or conn.get('connector_version') != CONNECTOR_VERSION:
+        return 'version', 'Connector version mismatch', None
+    if conn.get('game_state') == 'stopped' or conn.get('status') == 'stopped':
+        return 'closed', 'Game closed · saved data', None
+    # Context is faster and authoritative for the second-monitor state. Never use
+    # cached context as live, and never mix sessions or game versions.
+    same = (ctx.get('session') == conn.get('session') and ctx.get('game_version') == conn.get('game_version'))
+    recent = ctx_disk and same and ctx.get('schema') == 1 and ctx.get('connector_version') == CONNECTOR_VERSION and age_of(ctx, now) <= 10
+    if not conn_disk or age_of(conn, now) > 30:
+        return 'stale', 'Stale connection · saved data', None
+    if recent:
+        state = ctx.get('state')
+        if state == 'stopped':
+            return 'closed', 'Game closed · saved data', None
+        if state in ACTIVE_BATTLE:
+            if valid_context(ctx):
+                return state, 'Connected · ' + ('Loading battle' if state == 'battle_loading' else 'In battle'), ctx
+            return state, 'Connected · waiting for map', None
+        if state in ('garage', 'matchmaking'):
+            return state, 'Connected · ' + ('Garage' if state == 'garage' else 'Matchmaking'), None
+        return 'waiting', 'Connected · waiting for garage', None
+    # Do not fall back to the last observed map or stale context.
+    return 'stale', 'Live battle context unavailable · saved data', None
+
+
+class Settings:
+    defaults = {'game_path': r'C:\Games\World_of_Tanks_EU', 'data_path': 'data', 'playstyle': 'Hybrid scout',
+                'strategy': 'Free-to-play', 'auto_switch': 'yes', 'remember_window': 'yes', 'always_on_top': 'no',
+                'geometry': '', 'maximized': 'no', 'update_checks': 'yes', 'update_prereleases': 'yes'}
+    def __init__(self, base):
+        self.base = base
+        self.path = base / 'settings.ini'
+        self.values = self.defaults.copy()
+        self.warning = ''
+        if self.path.exists():
+            try:
+                p = configparser.ConfigParser(interpolation=None)
+                p.read(self.path, encoding='utf-8')
+                self.values.update({k: v for k, v in p.items('Desktop') if k in self.defaults})
+            except (OSError, configparser.Error, ValueError) as exc:
+                self.warning = 'Settings unreadable; defaults used: ' + str(exc)
+        if self.values['playstyle'] not in PLAYSTYLES:
+            self.values['playstyle'] = self.defaults['playstyle']
+        if self.values['strategy'] not in ('Free-to-play', 'Current account'):
+            self.values['strategy'] = self.defaults['strategy']
+    def flag(self, key):
+        return self.values.get(key, '').lower() in ('yes', 'true', '1')
+    @property
+    def data(self):
+        return absolute(self.base, self.values['data_path'])
+    def save(self):
+        p = configparser.ConfigParser(interpolation=None)
+        p['Desktop'] = self.values
+        s = io.StringIO(); p.write(s); atomic_text(self.path, s.getvalue())
+
+
+class Store:
+    """A disposable derived local cache. Source exports are never modified."""
+    def __init__(self, root):
+        self.root = root
+        self.folder = root / 'database'
+        self.folder.mkdir(parents=True, exist_ok=True)
+        self.path = self.folder / 'quartermaster.sqlite3'
+        self.db = sqlite3.connect(self.path, timeout=2)
+        try:
+            version = self.db.execute('PRAGMA user_version').fetchone()[0]
+            if version not in (0, DB_SCHEMA):
+                raise ValueError('Unsupported desktop database schema: ' + str(version))
+            with self.db:
+                self.db.execute('CREATE TABLE IF NOT EXISTS snapshots (source TEXT PRIMARY KEY, payload TEXT NOT NULL, observed REAL NOT NULL)')
+                self.db.execute('CREATE TABLE IF NOT EXISTS map_records (arena_id TEXT PRIMARY KEY, payload TEXT NOT NULL)')
+                self.db.execute('CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)')
+                self.db.execute(f'PRAGMA user_version={DB_SCHEMA}')
+        except Exception:
+            self.db.close(); raise
+    def get(self, key):
+        row = self.db.execute('SELECT payload FROM snapshots WHERE source=?', (key,)).fetchone()
+        return json.loads(row[0]) if row else {}
+    def put(self, key, value):
+        with self.db:
+            self.db.execute('INSERT OR REPLACE INTO snapshots VALUES (?,?,?)', (key, json.dumps(value, ensure_ascii=True), time.time()))
+    def maps(self, rows, identity):
+        encoded = json.dumps(identity, sort_keys=True)
+        prior = self.db.execute("SELECT value FROM metadata WHERE key='map_identity'").fetchone()
+        if prior and prior[0] == encoded:
+            return
+        with self.db:
+            self.db.execute('DELETE FROM map_records')
+            self.db.executemany('INSERT INTO map_records VALUES (?,?)', ((str(k), json.dumps(v, ensure_ascii=True)) for k, v in rows.items()))
+            self.db.execute('INSERT OR REPLACE INTO metadata VALUES (?,?)', ('map_identity', encoded))
+    def reset(self):
+        with self.db:
+            self.db.execute('DELETE FROM snapshots'); self.db.execute('DELETE FROM map_records'); self.db.execute('DELETE FROM metadata')
+    def close(self):
+        self.db.close()
+
+
+class MapCatalogue:
+    def __init__(self, root):
+        self.root = root / 'catalogue'
+        self.rows = {}
+        self.identity = None
+        self.version = None
+        self.folder = None
+        self.status = 'Map catalogue not loaded'
+        self.stamp = None
+    def load(self, conn, force=False):
+        # Prefer the validated root pointer, not an absolute path from an old PC.
+        pointer_path = self.root / 'manifest.json'
+        try:
+            pointer = read_json(pointer_path)
+            if pointer.get('schema') != 2 or pointer.get('status') != 'complete':
+                raise ValueError('Catalogue pointer not complete')
+            version = pointer.get('game_version')
+            generation = safe_child(self.root, pointer.get('relative_path'))
+            manifest_path = generation / 'manifest.json'
+            enrich = generation / 'enrichment-v1'
+            enrich_path = enrich / 'manifest.json'
+            paths = [pointer_path, manifest_path, generation/'maps.json', enrich_path, enrich/'maps.json']
+            stamp = tuple((str(p), p.stat().st_size, p.stat().st_mtime_ns) if p.is_file() else (str(p), None, None) for p in paths)
+            if not force and stamp == self.stamp:
+                return False
+            self.stamp = stamp
+            manifest = read_json(manifest_path)
+            if manifest.get('status') != 'complete' or manifest.get('schema') != 2 or manifest.get('game_version') != version:
+                raise ValueError('Base catalogue identity mismatch')
+            binfo = obj(obj(manifest.get('files')).get('maps'))
+            base = json.loads(verified_bytes(generation / 'maps.json', binfo.get('sha256')))
+            if base.get('category') != 'maps' or base.get('schema') != 2 or base.get('game_version') != version or len(obj(base.get('rows'))) != binfo.get('count'):
+                raise ValueError('Base map schema/count mismatch')
+            details = {}; einfo = {}; warning = ''
+            try:
+                em = read_json(enrich_path)
+                if em.get('status') not in ('complete', 'partial') or em.get('schema') != 1 or em.get('game_version') != version:
+                    raise ValueError('Enrichment identity mismatch')
+                hashes = {k: v.get('sha256') for k, v in obj(manifest.get('files')).items()}
+                if em.get('base_checksums') != hashes:
+                    raise ValueError('Enrichment belongs to a different catalogue')
+                einfo = obj(obj(em.get('files')).get('maps'))
+                ep = json.loads(verified_bytes(enrich / 'maps.json', einfo.get('sha256')))
+                if ep.get('category') != 'maps' or ep.get('schema') != 1 or ep.get('game_version') != version or ep.get('base_checksums') != hashes or len(obj(ep.get('rows'))) != einfo.get('count'):
+                    raise ValueError('Enriched map schema/count mismatch')
+                details = obj(ep.get('rows'))
+            except (OSError, ValueError, KeyError, TypeError) as exc:
+                warning = ' · Minimap data unavailable: ' + str(exc)
+            self.rows = {str(k): {'base': obj(v), 'detail': obj(details.get(str(k)))} for k, v in obj(base.get('rows')).items()}
+            self.version, self.folder = version, enrich
+            self.identity = [str(generation), version, binfo.get('sha256'), einfo.get('sha256') if details else None]
+            self.status = f'{len(self.rows)} map records · {version}' + warning
+            return True
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            changed = bool(self.rows) or self.status != 'Catalogue unavailable: ' + str(exc)
+            self.rows, self.identity, self.version, self.folder = {}, None, None, None
+            self.stamp = None
+            self.status = 'Catalogue unavailable: ' + str(exc)
+            return changed
+    def resolve(self, context):
+        if not context or self.version != context.get('game_version'):
+            return None
+        key = str(context.get('arena_type_id'))
+        if key in self.rows:
+            base = self.rows[key]['base']
+            if str(base.get('geometryID')) == str(context.get('geometry_id')) and (context.get('gameplay_id') is None or base.get('gameplayID') == context.get('gameplay_id')):
+                return key
+        # Do not silently choose a different variant when geometry is ambiguous.
+        found = [k for k, r in self.rows.items() if r['base'].get('geometryName') == context.get('geometry_name') and r['base'].get('gameplayID') == context.get('gameplay_id')]
+        return found[0] if len(found) == 1 else None
+    def image_png(self, key):
+        from PIL import Image
+        row = self.rows.get(str(key), {})
+        image = obj(obj(row.get('detail')).get('image'))
+        if not image or self.folder is None:
+            raise ValueError('No extracted minimap for this map variant')
+        path = safe_child(self.folder, image.get('file'))
+        raw = verified_bytes(path, image.get('sha256'))
+        if len(raw) != image.get('bytes'):
+            raise ValueError('Minimap size mismatch')
+        with Image.open(io.BytesIO(raw)) as im:
+            im.load()
+            out = io.BytesIO(); im.convert('RGBA').save(out, 'PNG'); return out.getvalue()
+
+
+class Model:
+    def __init__(self, root):
+        self.root = root
+        self.store = Store(root)
+        self.catalogue = MapCatalogue(root)
+        self.sources = {k: self.store.get(k) for k in ('connector', 'diagnostics')}
+        self.sources['battle_context'] = {}
+        self.stamps = {}
+        self.disk = {}
+        self.errors = {}
+        self.next_catalogue_check = 0
+        self.state, self.status, self.context = 'missing', 'Connector missing', None
+    def _read(self, key):
+        path = self.root / 'connector' / (key + '.json')
+        try:
+            st = path.stat(); stamp = (st.st_size, st.st_mtime_ns)
+            if self.stamps.get(key) == stamp and self.disk.get(key):
+                return
+            data = read_json(path)
+            if key == 'diagnostics':
+                if not isinstance(data.get('sections'), dict) or not isinstance(data.get('account'), dict):
+                    raise ValueError('Invalid diagnostics structure')
+            elif key == 'connector':
+                if not isinstance(data.get('data'), dict) or not isinstance(data.get('session'), str):
+                    raise ValueError('Invalid connector structure')
+            elif not isinstance(data.get('session'), str) or not isinstance(data.get('state'), str):
+                raise ValueError('Invalid battle context structure')
+            self.sources[key] = data
+            self.stamps[key] = stamp
+            self.disk[key] = True
+            self.errors.pop(key, None)
+            if key != 'battle_context':
+                try: self.store.put(key, data)
+                except (sqlite3.Error, OSError) as exc: self.errors['database'] = str(exc)
+        except (OSError, ValueError, TypeError, UnicodeError) as exc:
+            self.disk[key] = False
+            self.errors[key] = str(exc)
+    def poll(self, force=False, now=None):
+        for key in ('connector', 'battle_context', 'diagnostics'):
+            self._read(key)
+        conn, ctx = self.sources['connector'], self.sources['battle_context']
+        self.state, self.status, self.context = connection(conn, ctx, self.disk.get('connector'), self.disk.get('battle_context'), now)
+        tick = time.monotonic()
+        changed = False
+        if force or tick >= self.next_catalogue_check:
+            self.next_catalogue_check = tick + 5
+            changed = self.catalogue.load(conn, force=force)
+            if changed and self.catalogue.identity:
+                try: self.store.maps(self.catalogue.rows, self.catalogue.identity)
+                except (sqlite3.Error, OSError) as exc: self.errors['database'] = str(exc)
+        return changed
+    @property
+    def account(self):
+        return obj(self.sources['connector'].get('data')) or obj(self.sources['diagnostics'].get('account'))
+    @property
+    def selected(self):
+        # A null selection during a transition must never default to another tank.
+        c = self.sources['connector']; tank = obj(self.account.get('selected_tank'))
+        if self.context and self.context.get('vehicle_id') is not None:
+            v = next((r for r in self.garage if str(r.get('intCD')) == str(self.context['vehicle_id'])), {})
+            if v:
+                return {'tank_id': v.get('intCD'), 'name': v.get('userName'), 'tier': v.get('level'), 'combat_xp': v.get('combat_xp')}
+            if str(tank.get('tank_id')) == str(self.context['vehicle_id']): return tank
+            return {'tank_id': self.context['vehicle_id']}
+        if tank: return tank
+        if self.state in ('closed', 'stale', 'missing', 'version'):
+            return obj(c.get('last_known_selected_tank'))
+        return {}
+    @property
+    def garage(self):
+        d = self.sources['diagnostics']; c = self.sources['connector']
+        # On a fresh login do not blend older account snapshots with a new session.
+        if c.get('session') and d.get('session') and c.get('session') != d.get('session'):
+            return []
+        items = obj(obj(d.get('sections')).get('garage')).get('data', [])
+        return [obj(x.get('vehicle')) for x in items if isinstance(x, dict) and isinstance(x.get('vehicle'), dict)] if isinstance(items, list) else []
+    def close(self): self.store.close()
+
+
+
+# --- Independent component updater -------------------------------------------------
+REPO = 'itsr0b0tninja/WoTQuartermaster'
+RELEASE_ROOT = 'https://github.com/' + REPO + '/releases/download/'
+MANIFEST_URL = 'https://raw.githubusercontent.com/' + REPO + '/main/components.json'
+COMPONENTS = {
+    'desktop': ('WoTQuartermaster.exe', 'v', 180 * 1024 * 1024),
+    'connector': ('wot_companion_connector.wotmod', 'connector-v', 10 * 1024 * 1024),
+    'replay_parser': ('WoT_Quartermaster_Replay_Parser.txt', 'replay-v', 5 * 1024 * 1024),
+    'tactics': ('tactics.json', 'tactics-v', 30 * 1024 * 1024),
+}
+HEX = re.compile(r'^[0-9a-f]{64}$')
+VER = re.compile(r'^(0|[1-9]\d{0,3})\.(0|[1-9]\d{0,3})\.(0|[1-9]\d{0,3})$')
+TOKEN = re.compile(r'^[0-9a-f]{32}$')
+ALLOWED_HOSTS = {'github.com', 'raw.githubusercontent.com', 'release-assets.githubusercontent.com', 'objects.githubusercontent.com'}
+
+def version_tuple(v):
+    if not isinstance(v,str) or not VER.fullmatch(v): raise ValueError('Unsupported component version')
+    return tuple(map(int,v.split('.')))
+
+def check_url(url):
+    p = urllib.parse.urlsplit(url)
+    if p.scheme != 'https' or p.hostname not in ALLOWED_HOSTS or p.username or p.password or p.port not in (None,443):
+        raise ValueError('Unexpected update download host')
+    return url
+
+class SafeRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return super().redirect_request(req,fp,code,msg,headers,check_url(newurl))
+
+def open_url(url):
+    req = urllib.request.Request(check_url(url),headers={'User-Agent':'WoTQuartermaster/'+VERSION,'Accept':'application/octet-stream'})
+    return urllib.request.build_opener(SafeRedirect()).open(req,timeout=15)
+
+def validate_manifest(raw):
+    if not isinstance(raw,dict) or raw.get('schema') != 1 or not isinstance(raw.get('components'),dict):
+        raise ValueError('Unsupported component manifest schema')
+    result = {}
+    for key, entry in raw['components'].items():
+        if key not in COMPONENTS: continue
+        if not isinstance(entry,dict): raise ValueError('Invalid component entry')
+        name,prefix,limit = COMPONENTS[key]
+        v = entry.get('version'); version_tuple(v)
+        if entry.get('asset') != name or entry.get('release') != prefix+v or entry.get('url') != RELEASE_ROOT+prefix+v+'/'+name:
+            raise ValueError('Unexpected '+key+' release location')
+        check_url(entry['url'])
+        if not isinstance(entry.get('sha256'),str) or not HEX.fullmatch(entry['sha256']):
+            raise ValueError('Missing component checksum')
+        if type(entry.get('size')) is not int or not 0 < entry['size'] <= limit:
+            raise ValueError('Invalid component size')
+        if entry.get('channel') not in ('alpha','stable'): raise ValueError('Unknown release channel')
+        if entry.get('min_desktop') is not None: version_tuple(entry['min_desktop'])
+        if key=='connector' and (entry.get('context_schema')!=1 or not isinstance(entry.get('game_versions'),list) or not entry['game_versions']):
+            raise ValueError('Unsupported Connector compatibility metadata')
+        result[key] = dict(entry)
+    if 'desktop' not in result or 'connector' not in result: raise ValueError('Incomplete component manifest')
+    return result
+
+def fetch_manifest():
+    with open_url(MANIFEST_URL) as response:
+        raw = response.read(256*1024+1)
+    if len(raw)>256*1024: raise ValueError('Manifest too large')
+    return validate_manifest(json.loads(raw.decode('utf-8')))
+
+def digest_file(path):
+    h = hashlib.sha256()
+    with path.open('rb') as f:
+        for block in iter(lambda:f.read(1024*1024),b''): h.update(block)
+    return h.hexdigest()
+
+def matches(path, entry):
+    try: return path.is_file() and path.stat().st_size==entry['size'] and digest_file(path)==entry['sha256']
+    except OSError: return False
+
+_ui_hash_cache={}
+def cached_match(path,entry):
+    try:
+        st=path.stat()
+        key=(str(path),st.st_size,st.st_mtime_ns,entry['sha256'])
+        if key not in _ui_hash_cache:
+            if len(_ui_hash_cache)>100: _ui_hash_cache.clear()
+            _ui_hash_cache[key]=matches(path,entry)
+        return _ui_hash_cache[key]
+    except (OSError,KeyError,TypeError): return False
+
+def verify_payload(key,path):
+    if key=='desktop':
+        with path.open('rb') as f:
+            if f.read(2)!=b'MZ': raise ValueError('Not a Windows executable')
+    elif key=='connector':
+        with zipfile.ZipFile(path) as z:
+            expected='res/scripts/client/gui/mods/mod_wot_companion_connector.pyc'
+            if z.namelist()!=[expected] or z.getinfo(expected).file_size>8*1024*1024 or z.testzip() is not None:
+                raise ValueError('Invalid Connector archive')
+            if z.read(expected)[:4]!=bytes.fromhex('03f30d0a'): raise ValueError('Unsupported Connector bytecode')
+    elif key=='replay_parser':
+        compile(path.read_text(encoding='utf-8'),str(path),'exec')
+    elif key=='tactics':
+        if not isinstance(read_json(path).get('schema'),int): raise ValueError('Invalid tactics schema')
+
+def download_component(key,entry,dest,cancel,progress):
+    # The manifest is validated even when the caller is the helper or a test.
+    name,prefix,limit=COMPONENTS[key]
+    if entry['url']!=RELEASE_ROOT+prefix+entry['version']+'/'+name: raise ValueError('Unexpected asset URL')
+    dest.parent.mkdir(parents=True,exist_ok=True)
+    tmp=dest.with_name(dest.name+'.part')
+    if shutil.disk_usage(dest.parent).free < entry['size']*2+16*1024*1024: raise OSError('Insufficient free disk space')
+    try:
+        n=0; h=hashlib.sha256()
+        with open_url(entry['url']) as response, tmp.open('wb') as f:
+            while True:
+                if cancel.is_set(): raise InterruptedError('Download cancelled')
+                block=response.read(256*1024)
+                if not block: break
+                n+=len(block)
+                if n>entry['size']: raise ValueError('Asset exceeds expected size')
+                h.update(block); f.write(block); progress(n,entry['size'])
+            f.flush(); os.fsync(f.fileno())
+        if cancel.is_set(): raise InterruptedError('Download cancelled')
+        if n!=entry['size'] or h.hexdigest()!=entry['sha256']: raise ValueError('Download size or SHA-256 mismatch')
+        verify_payload(key,tmp); os.replace(tmp,dest)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+def game_folder_version(game, reported=''):
+    # Do not choose the lexicographically newest directory after a game update.
+    try:
+        import xml.etree.ElementTree as ET
+        file=game/'version.xml'
+        if file.is_file():
+            root=ET.parse(file).getroot()
+            for item in root.iter():
+                m=re.search(r'(?<!\d)(\d+\.\d+\.\d+\.\d+)(?!\d)',item.text or '')
+                if m and (game/'mods'/m.group(1)).is_dir(): return m.group(1)
+        m=re.search(r'(?<!\d)(\d+\.\d+\.\d+\.\d+)(?!\d)',reported or '')
+        if m and (game/'mods'/m.group(1)).is_dir(): return m.group(1)
+        dirs=[p.name for p in (game/'mods').iterdir() if p.is_dir() and re.fullmatch(r'\d+\.\d+\.\d+\.\d+',p.name)]
+        return dirs[0] if len(dirs)==1 else None
+    except (OSError,ValueError,ET.ParseError): return None
+
+def write_connector_ini(folder,data):
+    if not data.is_absolute() or not data.is_dir() or any(c in str(data) for c in '\r\n'):
+        raise ValueError('Save a valid existing absolute data directory first')
+    atomic_text(folder/'connector.ini','[Connector]\ndata_path='+str(data)+'\n')
+
+def game_running():
+    if os.name!='nt': return False
+    result=subprocess.run(['tasklist','/FO','CSV','/NH'],capture_output=True,text=True,errors='replace',timeout=8,creationflags=subprocess.CREATE_NO_WINDOW)
+    if result.returncode: raise OSError('Could not verify whether World of Tanks is running')
+    return any(row and row[0].casefold() in ('worldoftanks.exe','worldoftanks64.exe','worldoftanks32.exe') for row in csv.reader(result.stdout.splitlines()))
+
+def update_paths(base):
+    root=base/'updates'
+    return root,root/'staging'/'WoTQuartermaster.exe',root/'backups'/'WoTQuartermaster.previous.exe'
+
+def copy_atomic(source,dest):
+    dest.parent.mkdir(parents=True,exist_ok=True)
+    tmp=dest.with_name(dest.name+'.copying')
+    try:
+        shutil.copyfile(source,tmp)
+        with tmp.open('rb+') as f: os.fsync(f.fileno())
+        os.replace(tmp,dest)
+    finally: tmp.unlink(missing_ok=True)
+
+def helper_environment():
+    env=os.environ.copy()
+    env['PYINSTALLER_RESET_ENVIRONMENT']='1'
+    return env
+
+def wait_parent(pid):
+    if os.name!='nt': raise OSError('Self-update requires Windows')
+    import ctypes
+    from ctypes import wintypes
+    kernel=ctypes.WinDLL('kernel32',use_last_error=True)
+    kernel.OpenProcess.argtypes=[wintypes.DWORD,wintypes.BOOL,wintypes.DWORD]; kernel.OpenProcess.restype=wintypes.HANDLE
+    kernel.WaitForSingleObject.argtypes=[wintypes.HANDLE,wintypes.DWORD]; kernel.WaitForSingleObject.restype=wintypes.DWORD
+    kernel.CloseHandle.argtypes=[wintypes.HANDLE]
+    handle=kernel.OpenProcess(0x00100000,False,pid)
+    if not handle:
+        if ctypes.get_last_error()==87: return
+        raise OSError('Cannot open prior desktop process')
+    try:
+        if kernel.WaitForSingleObject(handle,30000)!=0: raise OSError('Desktop did not close')
+    finally: kernel.CloseHandle(handle)
+
+def replace_retry(source,target):
+    for attempt in range(30):
+        try: copy_atomic(source,target); return
+        except PermissionError:
+            if attempt==29: raise
+            time.sleep(.3)
+
+def backup_info(base, cached=False):
+    root,stage,backup=update_paths(base)
+    entry=read_json(root/'backups'/'previous.json')
+    version_tuple(entry['version'])
+    if not (cached_match if cached else matches)(backup,entry): raise ValueError('Previous executable missing or damaged')
+    return entry
+
+def apply_update_helper(base,token,parent):
+    root,stage,backup=update_paths(base)
+    if not TOKEN.fullmatch(token): return 2
+    target=base/'WoTQuartermaster.exe'
+    request=root/('request-'+token+'.json'); health=root/('healthy-'+token+'.json')
+    log=root/'update-result.json'
+    proc=None; swapped=False; old_saved=False; parent_closed=False
+    try:
+        entry=read_json(request)
+        if entry.get('token')!=token or entry.get('parent')!=parent: raise ValueError('Update request mismatch')
+        version_tuple(entry['version']); version_tuple(entry['old_version'])
+        wait_parent(parent); parent_closed=True
+        if not matches(stage,entry): raise ValueError('Staged executable missing or damaged')
+        verify_payload('desktop',stage)
+        if not target.is_file() or game_running(): raise OSError('Close the game before applying updates')
+        old={'version':entry['old_version'],'size':target.stat().st_size,'sha256':digest_file(target)}
+        copy_atomic(target,backup); old_saved=True
+        atomic_text(root/'backups'/'previous.json',json.dumps(old))
+        replace_retry(stage,target); swapped=True
+        proc=subprocess.Popen([str(target),'--update-health',token],cwd=str(base),env=helper_environment())
+        deadline=time.monotonic()+100
+        while time.monotonic()<deadline:
+            if health.is_file():
+                ack=read_json(health)
+                if ack.get('token')==token and ack.get('version')==entry['version'] and proc.poll() is None:
+                    atomic_text(log,json.dumps({'status':'success','version':entry['version']}))
+                    stage.unlink(missing_ok=True); return 0
+            if proc.poll() is not None: break
+            time.sleep(.5)
+        raise OSError('Updated desktop did not confirm successful startup')
+    except Exception as exc:
+        message=str(exc); recovery='not needed'
+        if swapped and old_saved:
+            try:
+                if proc and proc.poll() is None:
+                    subprocess.run(['taskkill','/PID',str(proc.pid),'/T','/F'],capture_output=True,timeout=15,creationflags=subprocess.CREATE_NO_WINDOW)
+                    proc.wait(timeout=15)
+                replace_retry(backup,target); recovery='previous executable restored'
+            except Exception as rollback:
+                recovery='automatic rollback failed: '+str(rollback)+'; backup retained at '+str(backup)
+        try: atomic_text(log,json.dumps({'status':'failed','error':message,'recovery':recovery}))
+        except OSError: pass
+        try:
+            if parent_closed and (not swapped or recovery=='previous executable restored'):
+                # If parent never exited, do not start a duplicate instance.
+                if target.is_file(): subprocess.Popen([str(target)],cwd=str(base),env=helper_environment())
+        except OSError: pass
+        return 1
+    finally:
+        request.unlink(missing_ok=True); health.unlink(missing_ok=True)
+
+def start_helper(base,entry):
+    if not getattr(sys,'frozen',False) or os.name!='nt': raise ValueError('Self-update requires the compiled Windows application')
+    root,stage,backup=update_paths(base)
+    target=base/'WoTQuartermaster.exe'
+    if Path(sys.executable).resolve()!=target.resolve(): raise ValueError('Name the running executable WoTQuartermaster.exe before updating')
+    if game_running(): raise ValueError('Close World of Tanks before installing the desktop update')
+    if not matches(stage,entry): raise ValueError('Staged desktop checksum mismatch')
+    token=secrets.token_hex(16)
+    runner=root/('runner-'+token+'.exe')
+    copy_atomic(target,runner)
+    atomic_text(root/('request-'+token+'.json'),json.dumps(dict(entry,token=token,parent=os.getpid(),old_version=VERSION)))
+    subprocess.Popen([str(runner),'--apply-update',token,str(os.getpid())],cwd=str(base),env=helper_environment(),creationflags=subprocess.CREATE_NO_WINDOW)
+
+STYLE = '''
+QWidget { background: #1c1e21; color: #e4e6e8; font-family: "Segoe UI"; font-size: 14px; }
+QFrame#Panel { background: #25282d; border: 1px solid #34383e; border-radius: 9px; }
+QFrame#Header { background: #22252a; border-bottom: 1px solid #373b41; }
+QFrame#Sidebar { background: #202328; border-right: 1px solid #373b41; }
+QLabel { background: transparent; }
+QLabel#Heading { font-size: 25px; font-weight: 650; }
+QLabel#Subheading { color: #aeb5be; font-size: 14px; }
+QLabel#Metric { font-size: 20px; font-weight: 650; color: #e6c58a; }
+QPushButton { background: #343940; color: #e7e9ec; padding: 9px 14px; border: 1px solid #454b54; border-radius: 6px; text-align: center; }
+QPushButton:hover { background: #41474e; } QPushButton:pressed { background: #50565c; }
+QPushButton:disabled { color: #858c95; background: #262a2e; }
+QPushButton#Nav { text-align: left; border: 0; background: transparent; padding: 12px; }
+QPushButton#Nav:checked { background: #38342e; color: #edc782; font-weight: 650; }
+QPushButton#Primary { background: #b28a48; color: #151515; font-weight: 650; border: 1px solid #c5a063; }
+QLineEdit, QComboBox, QListWidget, QTableWidget { background: #24272b; color: #e4e6e8; border: 1px solid #41464d; border-radius: 5px; padding: 5px; selection-background-color: #59492f; }
+QHeaderView::section { background: #30343a; padding: 8px; border: 0; border-bottom: 1px solid #454a50; color: #c6ccd3; }
+QTableWidget { gridline-color: #34383e; }
+QCheckBox { spacing: 8px; } QScrollArea { border: 0; } QToolTip { color: white; background: #30353a; border: 1px solid #555; }
+'''
+
+
+def run_gui(base, health_token=None):
+    from PySide6.QtCore import Qt, QTimer, QSize, QByteArray, QLockFile
+    from PySide6.QtGui import QPixmap, QIcon, QFont, QColor, QPainter
+    from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QFrame, QLabel, QPushButton, QVBoxLayout,
+        QHBoxLayout, QGridLayout, QStackedWidget, QButtonGroup, QLineEdit, QComboBox, QCheckBox, QFileDialog,
+        QMessageBox, QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView, QListWidget, QListWidgetItem,
+        QSplitter, QScrollArea, QFormLayout, QSizePolicy, QProgressBar)
+    app = QApplication(sys.argv[:1]); app.setApplicationName('WoTQuartermaster'); app.setStyle('Fusion'); app.setStyleSheet(STYLE)
+    app.setFont(QFont('Segoe UI', 10))
+    (base/'updates').mkdir(exist_ok=True)
+    lock=QLockFile(str(base/'updates'/'desktop.lock')); lock.setStaleLockTime(0)
+    if not lock.tryLock(0):
+        if not health_token: QMessageBox.information(None,'WoTQuartermaster','WoTQuartermaster is already running.')
+        return 1
+
+    def label(text='', kind=None, wrap=False):
+        w = QLabel(text); w.setTextFormat(Qt.TextFormat.PlainText); w.setWordWrap(wrap)
+        if kind: w.setObjectName(kind)
+        return w
+    def panel():
+        f = QFrame(); f.setObjectName('Panel'); l = QVBoxLayout(f); l.setContentsMargins(16, 14, 16, 14); l.setSpacing(8); return f, l
+    def heading(layout, title, subtitle=''):
+        layout.addWidget(label(title, 'Heading'))
+        if subtitle: layout.addWidget(label(subtitle, 'Subheading', True))
+    def page():
+        w = QWidget(); l = QVBoxLayout(w); l.setContentsMargins(24, 22, 24, 18); l.setSpacing(16); return w, l
+    def fmt_time(value):
+        try: return datetime.fromtimestamp(float(value)).strftime('%d %b %Y %H:%M:%S')
+        except (ValueError, TypeError, OSError, OverflowError): return 'Unknown'
+
+    class MapImage(QWidget):
+        def __init__(self):
+            super().__init__(); self.pix = QPixmap(); self.message = 'No map selected'; self.setMinimumSize(200, 200)
+            self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        def set_map(self, data=None, message=''):
+            self.pix = QPixmap(); self.message = message
+            if data and not self.pix.loadFromData(data, 'PNG'): self.message = 'Could not display minimap'
+            self.update()
+        def paintEvent(self, event):
+            p = QPainter(self); p.fillRect(self.rect(), QColor('#141619'))
+            if self.pix.isNull():
+                p.setPen(QColor('#aeb5be')); p.drawText(self.rect().adjusted(12,12,-12,-12), int(Qt.AlignmentFlag.AlignCenter) | int(Qt.TextFlag.TextWordWrap), self.message)
+            else:
+                pix = self.pix.scaled(self.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+                p.drawPixmap((self.width()-pix.width())//2, (self.height()-pix.height())//2, pix)
+            p.end()
+
+    class Window(QMainWindow):
+        def __init__(self):
+            super().__init__(); self.settings = Settings(base); self.model = None; self.model_error = ''; self.last_auto = None
+            self.last_render = None; self.last_map = None; self.last_atlas = None; self.manual_atlas = None; self.thumb_queue = []
+            self.setWindowTitle('WoTQuartermaster  ·  v' + VERSION); self.resize(1160, 760); self.setMinimumSize(720, 480)
+            self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
+            self.root = QWidget(); self.setCentralWidget(self.root); all_layout = QVBoxLayout(self.root); all_layout.setContentsMargins(0,0,0,0); all_layout.setSpacing(0)
+            header = QFrame(); header.setObjectName('Header'); h = QHBoxLayout(header); h.setContentsMargins(18,12,18,12)
+            h.addWidget(label('WoTQuartermaster', 'Heading')); h.addWidget(label('ALPHA '+VERSION, 'Subheading')); h.addStretch(1)
+            self.update_indicator=QPushButton('Updates available'); self.update_indicator.hide(); self.update_indicator.clicked.connect(lambda:self.navigate('Updates')); h.addWidget(self.update_indicator)
+            self.connection_label = label('Starting…'); h.addWidget(self.connection_label); all_layout.addWidget(header)
+            body = QHBoxLayout(); body.setContentsMargins(0,0,0,0); body.setSpacing(0); all_layout.addLayout(body,1)
+            side = QFrame(); side.setObjectName('Sidebar'); side.setFixedWidth(160); sl = QVBoxLayout(side); sl.setContentsMargins(10,16,10,10); sl.setSpacing(5)
+            body.addWidget(side); self.stack = QStackedWidget(); body.addWidget(self.stack,1)
+            self.group = QButtonGroup(self); self.group.setExclusive(True); self.nav = {}; self.pages = {}
+            for name in ('Overview','Garage','Progression','Equipment','Map atlas','History','Settings','Updates','Battle'):
+                b = QPushButton(name); b.setObjectName('Nav'); b.setCheckable(True); self.group.addButton(b); sl.addWidget(b); self.nav[name]=b
+                b.clicked.connect(lambda checked=False,n=name:self.navigate(n))
+            sl.addStretch(1); sl.addWidget(label('LOCAL DATA ONLY', 'Subheading', True))
+            self.footer = label('Initialising…','Subheading', True); self.footer.setContentsMargins(16,8,16,8); all_layout.addWidget(self.footer)
+            self.make_overview(); self.make_garage(); self.make_placeholder('Progression','Research and tank purchases','Progression advisor is scheduled for v0.6.0. No purchase recommendations are calculated yet.'); self.make_placeholder('Equipment','Vehicle configuration','Module, equipment, crew and ammunition advice is scheduled for v0.7.0. No configuration recommendations are calculated yet.'); self.make_atlas(); self.make_placeholder('History','Battle history','The existing replay importer and history files are preserved. History browsing and per-battle averages are scheduled for v0.4.0.'); self.make_settings(); self.make_updates(); self.make_battle()
+            self.open_model(); self.navigate('Overview'); self.restore_window(); self.tick(True)
+            self.timer = QTimer(self); self.timer.timeout.connect(self.tick); self.timer.start(1000)
+            self.thumb_timer = QTimer(self); self.thumb_timer.timeout.connect(self.next_thumbnail); self.thumb_timer.start(70)
+            self.update_timer=QTimer(self); self.update_timer.timeout.connect(self.poll_updates); self.update_timer.start(200)
+            self.check_timer=QTimer(self); self.check_timer.timeout.connect(self.auto_check_updates); self.check_timer.start(60000)
+            if self.settings.flag('update_checks'): QTimer.singleShot(2000,self.auto_check_updates)
+        def add_page(self, name, w): self.pages[name]=w; self.stack.addWidget(w)
+        def navigate(self, name):
+            self.stack.setCurrentWidget(self.pages[name]); self.nav[name].setChecked(True)
+            if name == 'Map atlas': self.refresh_atlas()
+        def make_overview(self):
+            w,l=page(); heading(l,'Overview','Your second-monitor garage companion')
+            f,v=panel(); self.tank_name=label('No vehicle selected','Heading'); self.tank_detail=label('Waiting for Connector data','Subheading',True); v.addWidget(self.tank_name); v.addWidget(self.tank_detail); l.addWidget(f)
+            grid=QGridLayout(); self.metrics={}
+            for i,(key,name) in enumerate([('credits','Credits'),('free_xp','Free XP'),('gold','Gold'),('bonds','Bonds'),('combat_xp','Vehicle XP'),('garage','Owned tanks')]):
+                f,v=panel(); v.addWidget(label(name,'Subheading')); x=label('—','Metric'); v.addWidget(x); self.metrics[key]=x; grid.addWidget(f,i//3,i%3)
+            l.addLayout(grid); f,v=panel(); v.addWidget(label('NEXT RECOMMENDED ACTION','Subheading')); v.addWidget(label('Recommendation engine not yet available','Heading',True)); v.addWidget(label('This alpha verifies data integration and automatic map switching. Financial, progression and configuration advice will follow in later versions.',wrap=True)); l.addWidget(f)
+            self.over_note=label('', 'Subheading',True); l.addWidget(self.over_note); l.addStretch(1); self.add_page('Overview',w)
+        def make_garage(self):
+            w,l=page(); heading(l,'Garage','Read-only inventory snapshot from the game client')
+            self.garage_note=label('Waiting for garage data','Subheading',True); l.addWidget(self.garage_note)
+            self.garage_table=QTableWidget(0,5); self.garage_table.setHorizontalHeaderLabels(['Vehicle','Tier','Vehicle XP','Gun','Equipment']); self.garage_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers); self.garage_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows); self.garage_table.verticalHeader().hide(); self.garage_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch); l.addWidget(self.garage_table,1); self.add_page('Garage',w)
+        def make_placeholder(self,name,title,desc):
+            w,l=page(); heading(l,title,'Under development'); f,v=panel(); v.addWidget(label(desc,wrap=True)); l.addWidget(f); l.addStretch(1); self.add_page(name,w)
+        def make_atlas(self):
+            w,l=page(); heading(l,'Map atlas','Browse every extracted map and variant. Tactical overlays are not yet implemented.')
+            self.atlas_status=label('Waiting for catalogue','Subheading',True); l.addWidget(self.atlas_status)
+            split=QSplitter(); self.map_list=QListWidget(); self.map_list.setIconSize(QSize(66,66)); self.map_list.setUniformItemSizes(True); self.map_list.setMinimumWidth(190); self.map_list.currentItemChanged.connect(self.atlas_selection); split.addWidget(self.map_list)
+            right=QWidget(); r=QVBoxLayout(right); self.atlas_name=label('Select a map','Heading',True); r.addWidget(self.atlas_name); self.atlas_info=label('','Subheading',True); r.addWidget(self.atlas_info); self.atlas_img=MapImage(); r.addWidget(self.atlas_img,1); self.atlas_desc=label('',wrap=True); r.addWidget(self.atlas_desc); split.addWidget(right); split.setStretchFactor(1,1); split.setSizes([240,650]); l.addWidget(split,1); self.add_page('Map atlas',w)
+        def make_battle(self):
+            w,l=page(); self.battle_title=label('Waiting for battle','Heading'); l.addWidget(self.battle_title); self.battle_info=label('No active live battle','Subheading',True); l.addWidget(self.battle_info); self.battle_image=MapImage(); l.addWidget(self.battle_image,1)
+            f,v=panel(); v.addWidget(label('TACTICAL ADVISOR','Subheading')); self.battle_note=label('Static minimap only in this alpha. Position recommendations will be added in v0.8.0.',wrap=True); v.addWidget(self.battle_note); l.addWidget(f); self.add_page('Battle',w)
+        def make_settings(self):
+            w,l=page(); heading(l,'Settings','Portable configuration stored beside the application')
+            scroll=QScrollArea(); scroll.setWidgetResizable(True); holder=QWidget(); h=QVBoxLayout(holder); h.setContentsMargins(0,0,0,0); scroll.setWidget(holder); l.addWidget(scroll,1)
+            f,v=panel(); form=QFormLayout(); v.addLayout(form); self.game_edit=QLineEdit(self.settings.values['game_path']); self.data_edit=QLineEdit(self.settings.values['data_path'])
+            for title,edit in [('World of Tanks folder',self.game_edit),('Data directory',self.data_edit)]:
+                row=QWidget(); rl=QHBoxLayout(row); rl.setContentsMargins(0,0,0,0); rl.addWidget(edit,1); b=QPushButton('Browse…'); b.clicked.connect(lambda checked=False,e=edit:self.choose_directory(e)); rl.addWidget(b); form.addRow(title,row)
+            self.play_combo=QComboBox(); self.play_combo.addItems(PLAYSTYLES); self.play_combo.setCurrentText(self.settings.values['playstyle']); form.addRow('Playstyle',self.play_combo)
+            self.strategy_combo=QComboBox(); self.strategy_combo.addItems(['Free-to-play','Current account']); self.strategy_combo.setCurrentText(self.settings.values['strategy']); form.addRow('Account strategy',self.strategy_combo)
+            self.checks={}
+            for key,desc in [('auto_switch','Automatically switch between garage and battle views'),('remember_window','Remember window position, size and monitor'),('always_on_top','Always on top (optional)')]:
+                c=QCheckBox(desc); c.setChecked(self.settings.flag(key)); self.checks[key]=c; v.addWidget(c)
+            v.addWidget(label('Automatic replay importing remains deferred. Manage downloads on the Updates page.','Subheading',True)); b=QPushButton('Save settings'); b.setObjectName('Primary'); b.clicked.connect(self.apply_settings); v.addWidget(b); h.addWidget(f)
+            f,v=panel(); v.addWidget(label('Local data and diagnostics','Heading')); self.diagnostic_label=label('',wrap=True); v.addWidget(self.diagnostic_label)
+            b=QPushButton('Reset desktop cache'); b.clicked.connect(self.reset_cache); v.addWidget(b); v.addWidget(label('Clears the derived SQLite cache only. Original game exports, history and catalogue remain untouched. The cache is repopulated on the next refresh.','Subheading',True))
+            b=QPushButton('Reset desktop preferences'); b.clicked.connect(self.reset_preferences); v.addWidget(b); h.addWidget(f); h.addStretch(1); self.add_page('Settings',w)
+
+        def make_updates(self):
+            self.update_entries={}; self.update_queue=queue.Queue(); self.update_cancel=threading.Event()
+            self.update_busy=False; self.installing=False; self.last_update_check=0; self.pending_desktop=None; self.last_check_text='Not checked'
+            self.update_rows={}
+            w,l=page(); heading(l,'Updates','Independent component versions · downloads from the project GitHub repository')
+            scroll=QScrollArea(); scroll.setWidgetResizable(True); holder=QWidget(); h=QVBoxLayout(holder); scroll.setWidget(holder); l.addWidget(scroll,1)
+            f,v=panel(); self.update_status=label('Not checked',wrap=True); v.addWidget(self.update_status)
+            self.check_updates_button=QPushButton('Check for updates'); self.check_updates_button.clicked.connect(lambda:self.check_updates(True)); v.addWidget(self.check_updates_button)
+            self.auto_updates=QCheckBox('Check at startup and every 60 minutes'); self.auto_updates.setChecked(self.settings.flag('update_checks'))
+            self.pre_updates=QCheckBox('Include development pre-releases'); self.pre_updates.setChecked(self.settings.flag('update_prereleases'))
+            for c in (self.auto_updates,self.pre_updates): c.toggled.connect(self.save_update_options); v.addWidget(c)
+            self.progress=QProgressBar(); self.progress.setRange(0,100); self.progress.hide(); v.addWidget(self.progress)
+            self.cancel_button=QPushButton('Cancel download'); self.cancel_button.clicked.connect(lambda:self.update_cancel.set()); self.cancel_button.hide(); v.addWidget(self.cancel_button)
+            h.addWidget(f)
+            for key,name in [('desktop','Desktop application'),('connector','Game Connector'),('replay_parser','Replay parser'),('tactics','Tactical database')]:
+                f,v=panel(); v.addWidget(label(name,'Heading')); details=label('',wrap=True); v.addWidget(details)
+                b=QPushButton('Download and install' if key=='desktop' else 'Download and prepare' if key=='connector' else 'Download component')
+                b.clicked.connect(lambda checked=False,k=key:self.download_selected(k)); v.addWidget(b)
+                self.update_rows[key]=(details,b); h.addWidget(f)
+            f,v=panel(); v.addWidget(label('Connector installation','Heading')); self.connector_destination=label('',wrap=True); v.addWidget(self.connector_destination)
+            b=QPushButton('Open prepared Connector folder'); b.clicked.connect(self.open_connector_folder); v.addWidget(b)
+            v.addWidget(label('Close the game before copying both prepared files into the indicated mods folder. The application never installs into the game automatically.',wrap=True)); h.addWidget(f)
+            f,v=panel(); v.addWidget(label('Recovery','Heading')); self.rollback_note=label('',wrap=True); v.addWidget(self.rollback_note)
+            self.rollback_button=QPushButton('Restore previous desktop version'); self.rollback_button.clicked.connect(self.rollback_desktop); v.addWidget(self.rollback_button); h.addWidget(f)
+            h.addStretch(1); self.add_page('Updates',w)
+            try:
+                prior=read_json(base/'updates'/'update-result.json'); self.update_status.setText('Previous update: '+str(prior.get('status'))+' '+str(prior.get('error',''))+' '+str(prior.get('recovery','')))
+            except (OSError,ValueError): pass
+            self.refresh_update_rows()
+        def save_update_options(self):
+            self.settings.values['update_checks']='yes' if self.auto_updates.isChecked() else 'no'
+            self.settings.values['update_prereleases']='yes' if self.pre_updates.isChecked() else 'no'
+            try: self.settings.save()
+            except OSError as exc: self.update_status.setText('Could not save update preferences: '+str(exc))
+            self.refresh_update_rows()
+        def start_update_job(self,job,download=False):
+            if self.update_busy: return
+            self.update_busy=True; self.update_cancel.clear(); self.progress.setValue(0); self.progress.setVisible(download); self.cancel_button.setVisible(download)
+            self.check_updates_button.setEnabled(False); self.refresh_update_rows()
+            def work():
+                try: self.update_queue.put(('done',job()))
+                except Exception as exc: self.update_queue.put(('error',str(exc)))
+            threading.Thread(target=work,daemon=True).start()
+        def auto_check_updates(self):
+            if self.settings.flag('update_checks') and (not self.last_update_check or time.monotonic()-self.last_update_check>=3600):
+                self.check_updates(False)
+        def check_updates(self,manual):
+            if self.update_busy: return
+            self.last_update_check=time.monotonic()
+            self.update_status.setText('Checking GitHub…')
+            self.start_update_job(lambda:('manifest',fetch_manifest()))
+        def local_component(self,key):
+            if key=='desktop': return VERSION
+            if key=='connector': return None
+            try:
+                folder=base/'components'/key
+                info=read_json(folder/'installed.json')
+                version_tuple(info['version'])
+                if cached_match(folder/COMPONENTS[key][0],info): return info['version']
+            except (OSError,ValueError,KeyError,TypeError): pass
+            return None
+        def visible_entry(self,key):
+            entry=self.update_entries.get(key)
+            return entry if entry and (entry['channel']=='stable' or self.settings.flag('update_prereleases')) else None
+        def compatible_entry(self,key,entry):
+            if entry.get('min_desktop') and version_tuple(VERSION)<version_tuple(entry['min_desktop']): return False
+            if key=='connector':
+                # This desktop recognizes the tested Connector version only. A new
+                # desktop can explicitly extend the accepted live schema versions.
+                return entry['version']==CONNECTOR_VERSION
+            return True
+        def refresh_update_rows(self):
+            conn=self.model.sources['connector'] if self.model else {}
+            game=absolute(base,self.settings.values['game_path'])
+            gv=game_folder_version(game,conn.get('game_version',''))
+            destination=game/'mods'/gv if gv else None
+            available=False
+            for key,(detail,button) in self.update_rows.items():
+                entry=self.visible_entry(key); local=self.local_component(key)
+                if key=='connector':
+                    running=conn.get('connector_version') if self.model and self.model.state in ('garage','matchmaking','battle_loading','in_battle') else None
+                    installed='Not verified'
+                    if destination:
+                        installed='Not found' if not (destination/COMPONENTS[key][0]).is_file() else 'Present; version unverified'
+                        if entry and cached_match(destination/COMPONENTS[key][0],entry): installed=entry['version']+' (verified package)'
+                    prepared='Not prepared'
+                    if entry and cached_match(base/'components'/'connector'/entry['version']/COMPONENTS[key][0],entry): prepared=entry['version']+' (verified)'
+                    detail.setText('Installed: '+installed+'\nRunning: '+str(running or 'Not running / not verified')+'\nPrepared: '+prepared+'\nAvailable: '+str(entry['version'] if entry else 'Unknown'))
+                    eligible=bool(entry and self.compatible_entry(key,entry) and gv and gv in entry['game_versions'])
+                    if entry and not eligible: detail.setText(detail.text()+'\nCompatibility not verified; download disabled')
+                    button.setEnabled(eligible and not self.update_busy)
+                    continue
+                newer=bool(entry and (local is None or version_tuple(entry['version'])>version_tuple(local)))
+                eligible=bool(entry and self.compatible_entry(key,entry))
+                available |= bool(newer and eligible)
+                detail.setText('Installed: '+str(local or 'Not installed')+'\nAvailable: '+str(entry['version'] if entry else 'Not listed / not checked')+('\nUpdate available' if newer and eligible else '\nIncompatible with this desktop' if newer else ''))
+                button.setEnabled(newer and eligible and not self.update_busy)
+            self.connector_destination.setText('Destination: '+str(destination or 'Game version directory not verified; check saved game path'))
+            try:
+                prior=backup_info(base,cached=True); self.rollback_note.setText('Previous verified executable: '+prior['version']); self.rollback_button.setEnabled(not self.update_busy)
+            except (OSError,ValueError,KeyError,TypeError): self.rollback_note.setText('No verified previous desktop executable'); self.rollback_button.setEnabled(False)
+            state=self.model.state if self.model else 'missing'
+            self.update_indicator.setVisible(available and state not in ACTIVE_BATTLE|{'matchmaking','waiting','stale','version'})
+        def poll_updates(self):
+            while True:
+                try: kind,payload=self.update_queue.get_nowait()
+                except queue.Empty: break
+                if kind=='progress':
+                    self.progress.setValue(int(payload[0]*100/payload[1])); continue
+                self.update_busy=False; self.progress.hide(); self.cancel_button.hide(); self.check_updates_button.setEnabled(True)
+                if kind=='error':
+                    self.update_status.setText('Update operation failed: '+payload+' · Existing components retained')
+                elif payload[0]=='manifest':
+                    self.update_entries=payload[1]; self.last_check_text=datetime.now().strftime('%d %b %H:%M'); self.update_status.setText('Checked: '+self.last_check_text)
+                elif payload[0]=='desktop':
+                    self.pending_desktop=payload[1]; self.update_status.setText('Verified desktop downloaded. Close the game before installing.')
+                    if (not self.model or self.model.state not in ACTIVE_BATTLE|{'matchmaking','waiting','stale'}) and QMessageBox.question(self,'Install desktop update','Restart WoTQuartermaster to install '+payload[1]['version']+'? Close World of Tanks first.')==QMessageBox.StandardButton.Yes: self.install_desktop(payload[1])
+                else: self.update_status.setText(payload[1])
+                self.refresh_update_rows()
+            # Avoid hashing installed/prepared packages every 200 ms.
+            if getattr(self,'update_refresh_at',0)<time.monotonic():
+                self.update_refresh_at=time.monotonic()+5; self.refresh_update_rows()
+        def download_selected(self,key):
+            entry=self.visible_entry(key)
+            if not entry or self.update_busy or not self.compatible_entry(key,entry): return
+            if key=='desktop' and self.pending_desktop==entry and matches(update_paths(base)[1],entry):
+                self.install_desktop(entry); return
+            if key=='desktop' and self.model and self.model.state in ACTIVE_BATTLE|{'matchmaking'}:
+                self.update_status.setText('Wait until the game is closed before installing the desktop update.'); return
+            data=self.settings.data
+            if key=='connector':
+                conn=self.model.sources['connector'] if self.model else {}
+                gv=game_folder_version(absolute(base,self.settings.values['game_path']),conn.get('game_version',''))
+                if gv not in entry['game_versions']: self.update_status.setText('Connector game-version compatibility not verified'); return
+            def job():
+                report=lambda n,total:self.update_queue.put(('progress',(n,total)))
+                root,stage,backup=update_paths(base)
+                if key=='desktop': dest=stage
+                elif key=='connector': dest=base/'components'/'connector'/entry['version']/COMPONENTS[key][0]
+                else: dest=base/'components'/key/'staging'/COMPONENTS[key][0]
+                download_component(key,entry,dest,self.update_cancel,report)
+                if key=='desktop': return ('desktop',entry)
+                if key=='connector':
+                    write_connector_ini(dest.parent,data)
+                    return ('message','Connector '+entry['version']+' prepared. Copy both files manually with the game closed.')
+                folder=base/'components'/key; target=folder/COMPONENTS[key][0]; prior=folder/'installed.json'
+                if target.is_file() and prior.is_file():
+                    copy_atomic(target,folder/'previous'/target.name); copy_atomic(prior,folder/'previous'/'installed.json')
+                # Verify first; atomic replacement of component and then metadata.
+                try:
+                    copy_atomic(dest,target); atomic_text(prior,json.dumps(entry))
+                except Exception:
+                    if (folder/'previous'/target.name).is_file() and (folder/'previous'/'installed.json').is_file():
+                        copy_atomic(folder/'previous'/target.name,target); copy_atomic(folder/'previous'/'installed.json',prior)
+                    raise
+                return ('message',key+' '+entry['version']+' installed locally; no automatic execution.')
+            self.update_status.setText('Downloading '+key+' '+entry['version']+'…'); self.start_update_job(job,True)
+        def install_desktop(self,entry):
+            try:
+                start_helper(base,entry); self.installing=True; self.close()
+            except (OSError,ValueError,subprocess.SubprocessError) as exc: self.update_status.setText('Cannot install: '+str(exc))
+        def rollback_desktop(self):
+            try:
+                if self.update_busy: return
+                if QMessageBox.question(self,'Restore previous version','Restore the verified previous desktop executable? Existing game data and settings will be kept.')!=QMessageBox.StandardButton.Yes: return
+                entry=backup_info(base); root,stage,backup=update_paths(base); copy_atomic(backup,stage); self.install_desktop(entry)
+            except (OSError,ValueError,KeyError,TypeError) as exc: self.update_status.setText('Rollback unavailable: '+str(exc))
+        def open_connector_folder(self):
+            try:
+                entry=self.visible_entry('connector')
+                if not entry: raise ValueError('Check for updates first')
+                folder=base/'components'/'connector'/entry['version']
+                if not matches(folder/COMPONENTS['connector'][0],entry): raise ValueError('Download and prepare the Connector first')
+                write_connector_ini(folder,self.settings.data)
+                os.startfile(str(folder))
+            except (OSError,ValueError) as exc: self.update_status.setText(str(exc))
+
+        def choose_directory(self,edit):
+            picked=QFileDialog.getExistingDirectory(self,'Choose directory',str(absolute(base,edit.text() or '.')))
+            if picked:
+                p=Path(picked).resolve(); edit.setText(str(p.relative_to(base)) if p.is_relative_to(base) else str(p))
+        def apply_settings(self):
+            try:
+                if not self.data_edit.text().strip() or not self.game_edit.text().strip(): raise ValueError('Both paths must be specified.')
+                data=absolute(base,self.data_edit.text().strip()); game=absolute(base,self.game_edit.text().strip())
+                if data == game or data.is_relative_to(game): raise ValueError('Choose a separate data folder outside the game installation.')
+                if data.exists() and not data.is_dir(): raise ValueError('Data path is not a directory.')
+                old=self.settings.values.copy(); old_data=self.settings.data
+                self.settings.values.update(game_path=self.game_edit.text().strip(),data_path=self.data_edit.text().strip(),playstyle=self.play_combo.currentText(),strategy=self.strategy_combo.currentText())
+                self.settings.values.update({k:'yes' if x.isChecked() else 'no' for k,x in self.checks.items()})
+                try: self.settings.save()
+                except Exception: self.settings.values=old; raise
+                if data != old_data or not self.model: self.open_model()
+                self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint,self.settings.flag('always_on_top')); self.show()
+                self.last_auto=None; self.tick(True); self.statusBar().showMessage('Settings saved locally',3000)
+            except (OSError,ValueError,sqlite3.Error) as exc: QMessageBox.warning(self,'Settings not saved',str(exc))
+        def open_model(self):
+            if self.model: self.model.close()
+            self.model=None; self.model_error=''; self.last_atlas=None; self.last_map=None; self.last_render=None; self.thumb_queue=[]
+            try: self.model=Model(self.settings.data)
+            except (OSError,ValueError,sqlite3.Error) as exc: self.model_error=str(exc)
+        def reset_cache(self):
+            if not self.model: return
+            if QMessageBox.question(self,'Reset desktop cache','Clear the desktop SQLite cache? Original Connector exports and battle history will NOT be deleted.', QMessageBox.StandardButton.Yes|QMessageBox.StandardButton.No,QMessageBox.StandardButton.No)==QMessageBox.StandardButton.Yes:
+                try: self.model.store.reset(); self.open_model(); self.tick(True)
+                except (OSError,sqlite3.Error,ValueError) as exc: QMessageBox.warning(self,'Reset failed',str(exc))
+        def reset_preferences(self):
+            if QMessageBox.question(self,'Reset preferences','Restore default desktop settings? Game data will not be deleted.',QMessageBox.StandardButton.Yes|QMessageBox.StandardButton.No,QMessageBox.StandardButton.No)!=QMessageBox.StandardButton.Yes: return
+            self.game_edit.setText(Settings.defaults['game_path']); self.data_edit.setText(Settings.defaults['data_path']); self.play_combo.setCurrentText(Settings.defaults['playstyle']); self.strategy_combo.setCurrentText(Settings.defaults['strategy'])
+            for k,c in self.checks.items(): c.setChecked(Settings.defaults[k]=='yes')
+            self.settings.values['geometry']=''; self.settings.values['maximized']='no'; self.apply_settings()
+        def restore_window(self):
+            self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint,self.settings.flag('always_on_top'))
+            if self.settings.flag('remember_window') and self.settings.values['geometry']:
+                try:
+                    g=QByteArray.fromBase64(self.settings.values['geometry'].encode('ascii')); self.restoreGeometry(g)
+                    if not any(self.frameGeometry().intersects(s.availableGeometry()) for s in app.screens()): self.move(app.primaryScreen().availableGeometry().topLeft())
+                except (ValueError,TypeError): pass
+            if self.settings.flag('remember_window') and self.settings.flag('maximized'): self.setWindowState(self.windowState() | Qt.WindowState.WindowMaximized)
+        def closeEvent(self,event):
+            self.timer.stop(); self.thumb_timer.stop(); self.update_timer.stop(); self.check_timer.stop()
+            if self.update_busy and not self.installing:
+                self.update_cancel.set(); event.ignore(); self.timer.start(1000); self.thumb_timer.start(70); self.update_timer.start(200); self.check_timer.start(60000); self.statusBar().showMessage('Cancelling update operation; close again when finished',5000); return
+            try:
+                if self.settings.flag('remember_window'):
+                    self.settings.values['geometry']=bytes(self.saveGeometry().toBase64()).decode('ascii'); self.settings.values['maximized']='yes' if self.isMaximized() else 'no'
+                self.settings.save()
+            except OSError: logging.exception('Could not save settings')
+            if self.model: self.model.close()
+            event.accept()
+        def tick(self,force=False):
+            if self.model is None:
+                self.connection_label.setText('Local storage unavailable'); self.footer.setText(self.model_error); self.diagnostic_label.setText(self.model_error); return
+            m=self.model
+            try: cat_changed=m.poll(force=bool(force))
+            except Exception as exc:
+                logging.exception('Refresh failed'); self.connection_label.setText('Refresh failed'); self.footer.setText(str(exc)); self.battle_image.set_map(message='Live data unavailable'); return
+            color='#84c998' if m.state in ('garage','matchmaking','battle_loading','in_battle') else '#e0bd7c' if m.state in ('stale','version','missing') else '#aeb5be'
+            self.connection_label.setStyleSheet('color:'+color+';font-weight:600;'); self.connection_label.setText(m.status)
+            conn=m.sources['connector']; diag=m.sources['diagnostics']; selected=m.selected; acc=m.account
+            self.tank_name.setText(selected.get('name') or ('Vehicle '+str(selected['tank_id']) if selected.get('tank_id') is not None else 'No vehicle selected'))
+            self.tank_detail.setText(('Tier '+str(selected['tier'])+'  ·  ' if selected.get('tier') is not None else '')+self.settings.values['playstyle']+'  ·  '+self.settings.values['strategy'])
+            for k in ('credits','free_xp','gold','bonds'): self.metrics[k].setText(number(acc.get(k)))
+            self.metrics['combat_xp'].setText(number(selected.get('combat_xp'))); self.metrics['garage'].setText(number(len(m.garage)) if m.garage else '—')
+            self.over_note.setText(('Saved account snapshot · ' if m.state in ('closed','stale','missing','version') else 'Account snapshot · ')+fmt_time(conn.get('sampled_at') or diag.get('sampled_at'))+('\nPremium account active' if acc.get('premium') is True else '\nStandard account' if acc.get('premium') is False else ''))
+            signature=(m.stamps.get('diagnostics'),conn.get('session'),diag.get('session'))
+            if force or signature!=self.last_render:
+                self.last_render=signature; rows=m.garage; self.garage_table.setRowCount(len(rows))
+                for i,row in enumerate(rows):
+                    equipment=', '.join(str(x.get('userName','')) for x in row.get('optDevices',[]) if isinstance(x,dict)) or 'None recorded'
+                    for j,val in enumerate([row.get('userName') or row.get('name'),row.get('level'),row.get('combat_xp'),obj(obj(row.get('modules')).get('gun')).get('userName'),equipment]): self.garage_table.setItem(i,j,QTableWidgetItem(number(val)))
+            self.garage_note.setText(f'{len(m.garage)} owned vehicles · snapshot {fmt_time(diag.get("sampled_at"))}' if m.garage else 'No matching garage snapshot yet')
+            if cat_changed or force: self.refresh_atlas()
+            self.render_battle()
+            # Switch only when entering a different battle or leaving the battle group;
+            # manual navigation is not overridden every poll. Never raise or activate.
+            mode=('battle',m.context.get('battle_id') if m.context else None) if m.state in ACTIVE_BATTLE else ('garage',None) if m.state in ('garage','matchmaking') else ('offline',None)
+            previous=self.last_auto
+            if self.settings.flag('auto_switch') and mode!=previous:
+                if mode[0]=='battle': self.navigate('Battle')
+                elif previous and previous[0]=='battle': self.navigate('Overview')
+            self.last_auto=mode
+            self.footer.setText(f'Connector {conn.get("connector_version","—")}  ·  Game {conn.get("game_version","—")}  ·  {m.state.replace("_"," ")}  ·  Database schema {DB_SCHEMA}')
+            game=absolute(base,self.settings.values['game_path']); errors='\n'.join(k+': '+str(v) for k,v in m.errors.items())
+            self.diagnostic_label.setText('Data: '+str(m.root)+'\nGame folder: '+('found' if (game/'mods').is_dir() else 'not found or unrecognised')+'\n'+m.catalogue.status+'\n'+('Connector data may be incomplete.' if diag.get('status')=='partial' else 'Diagnostics: '+str(diag.get('status','—')))+('\n'+self.settings.warning if self.settings.warning else '')+('\n'+errors if errors else ''))
+        def render_battle(self):
+            m=self.model; c=m.context
+            if not c:
+                self.battle_title.setText('Waiting for battle map' if m.state in ACTIVE_BATTLE else 'No active battle'); self.battle_info.setText(m.status)
+                if self.last_map!=('none',m.state): self.last_map=('none',m.state); self.battle_image.set_map(message='Waiting for live map information' if m.state in ACTIVE_BATTLE else 'No current battle map')
+                return
+            key=m.catalogue.resolve(c); team=c.get('team') if c.get('team_ready') is True else None; t=m.selected
+            self.battle_title.setText(str(c.get('map_name') or 'Map '+str(c.get('map_id')))); self.battle_info.setText((t.get('name') or 'Vehicle '+str(c.get('vehicle_id') or 'pending'))+'  ·  '+self.settings.values['playstyle']+'  ·  '+('Team '+str(team) if team is not None else 'Waiting for team')+'  ·  '+str(c.get('gameplay_name') or 'Mode pending'))
+            stamp=(c.get('battle_id'),key,str(m.catalogue.identity),self.battle_image.message)
+            if self.last_map and self.last_map[:3]==stamp[:3] and not self.battle_image.pix.isNull(): return
+            if self.last_map and self.last_map[:3]==stamp[:3] and time.monotonic()-getattr(self,'last_map_try',0)<5: return
+            self.last_map=stamp; self.last_map_try=time.monotonic()
+            try:
+                if key is None: raise ValueError('No exact map variant in the matching game catalogue')
+                self.battle_image.set_map(m.catalogue.image_png(key))
+            except (OSError,ValueError,TypeError,ImportError) as exc: self.battle_image.set_map(message=str(exc))
+        def refresh_atlas(self):
+            if not self.model: return
+            cat=self.model.catalogue; self.atlas_status.setText(cat.status)
+            identity=(str(cat.identity),len(cat.rows))
+            if identity==self.last_atlas: return
+            self.last_atlas=identity; old=self.manual_atlas; self.thumb_queue=[]; self.map_list.clear(); pick=None
+            for key,row in sorted(cat.rows.items(),key=lambda x:(str(x[1]['base'].get('name','')).casefold(),str(x[1]['base'].get('gameplayName','')),x[0])):
+                b=row['base']; name=b.get('name') or b.get('geometryName') or ('Map '+key); item=QListWidgetItem(f'{name}\n{b.get("gameplayName","—")} · {key}'); item.setData(Qt.ItemDataRole.UserRole,key); item.setSizeHint(QSize(180,72)); self.map_list.addItem(item)
+                self.thumb_queue.append((identity,item,key));
+                if key==old: pick=item
+            if pick: self.map_list.setCurrentItem(pick)
+            elif self.map_list.count(): self.map_list.setCurrentRow(0)
+            else: self.atlas_img.set_map(message='No catalogue'); self.atlas_name.setText('No maps available'); self.atlas_info.clear(); self.atlas_desc.clear()
+        def next_thumbnail(self):
+            if not self.thumb_queue or self.stack.currentWidget()!=self.pages['Map atlas']: return
+            identity,item,key=self.thumb_queue.pop(0)
+            if identity!=self.last_atlas or not self.model: return
+            try:
+                p=QPixmap(); p.loadFromData(self.model.catalogue.image_png(key),'PNG'); item.setIcon(QIcon(p.scaled(66,66,Qt.AspectRatioMode.KeepAspectRatio,Qt.TransformationMode.SmoothTransformation)))
+            except (OSError,ValueError,TypeError,ImportError): pass
+        def atlas_selection(self,current,previous):
+            if not current or not self.model: return
+            key=current.data(Qt.ItemDataRole.UserRole); self.manual_atlas=key; row=self.model.catalogue.rows.get(key,{})
+            b=obj(row.get('base')); d=obj(row.get('detail')); self.atlas_name.setText(str(b.get('name') or 'Map '+str(key))); self.atlas_info.setText(str(b.get('geometryName','—'))+'  ·  '+str(b.get('gameplayName','—'))+'  ·  Arena '+str(key)+'\nAvailability not verified; catalogue includes special and inactive variants.'); self.atlas_desc.setText(str(b.get('description') or ''))
+            try: self.atlas_img.set_map(self.model.catalogue.image_png(key))
+            except (OSError,ValueError,TypeError,ImportError) as exc: self.atlas_img.set_map(message=str(exc))
+    window=Window(); window.show()
+    if not health_token:
+        for runner in (base/'updates').glob('runner-*.exe'):
+            try: runner.unlink()
+            except OSError: pass
+    if health_token and TOKEN.fullmatch(health_token):
+        def confirm_startup():
+            if window.model is not None and window.isVisible():
+                atomic_text(base/'updates'/('healthy-'+health_token+'.json'),json.dumps({'token':health_token,'version':VERSION}))
+        QTimer.singleShot(3000,confirm_startup)
+    try: return app.exec()
+    finally: lock.unlock()
+
+
+def main():
+    parser=argparse.ArgumentParser(description='WoTQuartermaster portable alpha')
+    parser.add_argument('--check-data',type=Path,help='Validate local data without opening Qt; no game modification')
+    parser.add_argument('--apply-update',nargs=2,metavar=('TOKEN','PARENT'))
+    parser.add_argument('--update-health')
+    args=parser.parse_args()
+    if args.apply_update:
+        token,pid=args.apply_update
+        if BASE.name!='updates' or not TOKEN.fullmatch(token) or not pid.isdigit(): return 2
+        return apply_update_helper(BASE.parent,token,int(pid))
+    if args.check_data is not None:
+        model=Model(args.check_data.resolve())
+        try:
+            model.poll(True); print(json.dumps({'state':model.state,'status':model.status,'account':model.account,'garage_count':len(model.garage),'map_records':len(model.catalogue.rows),'catalogue_status':model.catalogue.status,'errors':model.errors},indent=2)); return 0
+        finally: model.close()
+    (BASE/'logs').mkdir(exist_ok=True)
+    logging.basicConfig(filename=BASE/'logs'/'desktop.log',level=logging.INFO,format='%(asctime)s %(levelname)s %(message)s',encoding='utf-8')
+    try: return run_gui(BASE,args.update_health)
+    except Exception:
+        logging.exception('Fatal desktop error'); raise
+
+if __name__=='__main__':
+    sys.exit(main())
