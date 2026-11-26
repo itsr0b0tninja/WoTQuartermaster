@@ -12,7 +12,9 @@ The Connector has been tested in World of Tanks EU 2.4.2.0; compatibility with o
 
 ## Connector installation (development build)
 
-A precompiled mod is not yet published. To build locally, download both TXT files from [connector/](connector/) into the same directory, preferably the WoTQuartermaster base folder. Run using CPython 2.7.18:
+The [compiled Connector v0.0.8 pre-release](https://github.com/itsr0b0tninja/WoTQuartermaster/releases/tag/connector-v0.0.8) includes the mod, an editable INI and a SHA-256 checksum. No Python installation is required to use the compiled mod. Edit the INI to point to your existing absolute data directory, close the game and copy both files into the active mods version folder.
+
+For developers who wish to build locally, download both TXT files from [connector/](connector/) into the same directory, preferably the WoTQuartermaster base folder. Run using CPython 2.7.18:
 
 ```bat
 C:\Python27\python.exe Build_WoT_Connector_v0.0.8.txt
@@ -22,7 +24,7 @@ The helper creates `wot_companion_connector.wotmod`, a `data` directory and, if 
 
 With the game closed, copy the .wotmod and connector.ini to the active version's `mods/<game-version>/` directory (for example `mods/2.4.2.0/`). Replace the previous Connector, not other mods. Keep your personal data and INI local. Start the game and verify the Connector writes to `data/connector/`.
 
-A compiled distribution is planned so normal users will not need Python 2.7.
+Compiled development releases are built through GitHub Actions from the tested source. The CI-produced binary has passed archive checks but has not yet been tested in-game.
 
 ## Replay importer
 
