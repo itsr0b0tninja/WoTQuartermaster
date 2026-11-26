@@ -6,7 +6,7 @@ A work-in-progress, portable Windows second-monitor companion for World of Tanks
 
 - Connector 0.0.8: live garage, catalogue, battle results and battle context (map/team/vehicle), exported locally.
 - Replay importer 0.0.7: local replay import, deduplication and reconciliation.
-- Desktop application 0.1.0: initial Windows alpha, built through GitHub Actions.
+- Desktop application 0.1.0: verified initial Windows alpha. Version 0.2.0 adds component updating and is built through GitHub Actions.
 
 The Connector has been tested in World of Tanks EU 2.4.2.0; compatibility with other client builds is not guaranteed. Battle context was verified on two battles on the same map and team. These are development components, not a finished advisor.
 
@@ -14,7 +14,13 @@ The Connector has been tested in World of Tanks EU 2.4.2.0; compatibility with o
 
 See the [releases page](https://github.com/itsr0b0tninja/WoTQuartermaster/releases) for the Windows executable. Place `WoTQuartermaster.exe` in the portable project folder beside your existing `data/` directory, or select that directory in Settings. Keep the tested Connector 0.0.8 installed; the desktop app does not modify the game. Open the app on a second monitor and start World of Tanks. The app displays garage resources, detects live battle context and selects the extracted minimap automatically. The map atlas can also be browsed manually. Settings, SQLite cache and logs are stored locally; the one-file executable uses temporary runtime extraction. No Python installation is required.
 
-The recommendation engines, integrated updates and automatic replay imports are not yet implemented. The desktop alpha is for testing the foundation, not a complete advisor.
+The recommendation engines and automatic replay imports are not yet implemented. The desktop alpha is for testing the foundation, not a complete advisor.
+
+## Integrated updater (0.2.0)
+
+Once the 0.2.0 alpha is available on the releases page, close the desktop app and replace only `WoTQuartermaster.exe`. Preserve your data folder and settings.ini. Open Updates to check the GitHub component manifest. Downloads are verified by size and SHA-256, and desktop installation requires confirmation and the game to be closed. A separate local helper backs up the previous executable, replaces it and restarts the application; startup confirmation is used for rollback. The real self-update cycle will be tested with 0.2.1.
+
+The Connector is prepared with an INI for the saved data path under `components/connector/`; copy the prepared files into the indicated mods version directory yourself with the game closed. The replay importer can be downloaded independently but is not executed automatically. The tactics component is not available yet. The current desktop accepts the tested Connector 0.0.8 only. No game or account data is uploaded.
 
 ## Connector installation (development build)
 
