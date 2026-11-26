@@ -1,0 +1,66 @@
+# Synthetic schema fixtures only; no player information is committed.
+import hashlib, json, tempfile, time, sys
+from pathlib import Path
+import importlib.machinery, importlib.util
+from garage_data import Garage
+def put(path,payload):
+    path.parent.mkdir(parents=True,exist_ok=True)
+    raw=json.dumps(payload).encode(); path.write_bytes(raw)
+    return {'sha256':hashlib.sha256(raw).hexdigest(),'count':len(payload.get('rows',{}))}
+def section(v,status='ok'): return {'data':v,'status':status}
+def fixture(root):
+    version='fixture-version'; folder=root/'catalogue'/'fixture'/'generation'
+    rows={'vehicles':{'100':{'userName':'Fixture tank','compatible_modules':{'chassis':[10],'engines':[20,21],'radios':[30],'turrets_and_guns':[{'turret':40,'guns':[50]},{'turret':41,'guns':[51]}]},'stock_parameters':{'circularVisionRadius':[300],'invisibilityStillFactor':{'current':10},'avgDamagePerMinute':900}}},
+          'engines':{'20':{'userName':'Engine A'},'21':{'userName':'Engine B','default_buy':{'credits':500}}},
+          'turrets':{'40':{'userName':'Turret A'},'41':{'userName':'Turret B'}},
+          'guns':{'50':{'userName':'Gun A','shell_ids':[70,71]},'51':{'userName':'Gun B'}},
+          'ammunition':{'70':{'userName':'AP shell','descriptor_fields':{'kind':'ARMOR_PIERCING'},'parameters':{'avgDamage':50},'default_buy':{'credits':12}},'71':{'userName':'HE shell','parameters':{'avgDamage':80}}},
+          'equipment':{'80':{'userName':'Optics'}},'consumables':{'90':{'userName':'Repair kit'}},'crew_perks':{'camouflage':{'name':'camouflage'}}}
+    files={cat:put(folder/(cat+'.json'),{'schema':2,'category':cat,'game_version':version,'rows':r}) for cat,r in rows.items()}
+    base={'schema':2,'status':'complete','game_version':version,'files':files}
+    put(folder/'manifest.json',base); put(root/'catalogue'/'manifest.json',dict(base,relative_path='fixture/generation'))
+    hashes={k:v['sha256'] for k,v in files.items()}
+    enrich={'guns':{'50':{'shots':[{'shell_id':70,'piercingPower':[60,45],'speed':500},{'shell_id':71,'piercingPower':[10,10],'speed':400}]}},'crew_perks':{'camouflage':{'display_name':'Concealment'}}}
+    ef={cat:put(folder/'enrichment-v1'/(cat+'.json'),{'schema':1,'category':cat,'game_version':version,'base_checksums':hashes,'rows':r}) for cat,r in enrich.items()}
+    put(folder/'enrichment-v1'/'manifest.json',{'schema':1,'status':'partial','game_version':version,'base_checksums':hashes,'files':ef})
+    def item(i,n): return {'intCD':i,'userName':n}
+    vehicle={'intCD':100,'invID':1,'userName':'Fixture tank','level':3,'combat_xp':123,'modules':{'engine':item(20,'Engine A'),'turret':item(40,'Turret A'),'gun':item(50,'Gun A'),'chassis':item(10,'Chassis'),'radio':item(30,'Radio')},'crew_slots':[{'slot':0,'crew_id':1}],'optDevices':[item(80,'Optics'),None],'consumables':[item(90,'Repair kit'),None],'ammo_capacity':100,'shells_layout':[{'intCD':70,'count':100},{'intCD':71,'count':0}]}
+    crew={'invID':1,'vehicleInvID':1,'fullUserName':'Synthetic commander','role':'commander','combinedRoles':['commander','gunner','loader','radioman'],'skills':[{'name':'camouflage','level':20}],'maxSkillsCount':6,'newSkillsCount':[0,20],'bonusSlotsLevels':[10,None,None],'bonus_skills':{'gunner':[{'name':'gunner_skill','level':10},None,None],'loader':[None,None,None],'radioman':[None,None,None]},'newBonusSkillsCountByRole':{'gunner':0,'loader':1,'radioman':1},'roleLevel':100}
+    sections={'garage':section([{'inventory_id':1,'vehicle':vehicle}]),'crew':section({'1':crew}),'depot':section({'EQUIPMENT':{'90':3},'OPTIONALDEVICE':{},'ENGINE':{'21':1},'LOOT_BOX':None},'partial'),'depot_details':section({'EQUIPMENT':{'90':{'count':3,'item':dict(item(90,'Repair kit'),buy={'credits':3000},sell={'credits':1500})}}}),'research':section({'unlocked_module_ids':[20,21,50],'initial_unlocks':[]}),
+        'progression':section({'owned_vehicle_paths':{'1':{'vehicle_id':100,'edges':[{'target_id':21,'unlocked':True,'xp_raw':10,'prerequisite_unlocked':{},'target':dict(item(21,'Engine B'),buy={'credits':400})},{'target_id':101,'unlocked':False,'xp_raw':200,'prerequisite_unlocked':{'21':True},'target':dict(item(101,'Next tank'),item_type_name='vehicle',tier=4,buy={'credits':1000})}]}}}),
+        'configured_performance':section({'1':{'vehicle_id':100,'modules':{'gun':50,'turret':40,'engine':20},'parameters':{'circularVisionRadius':[320],'avgDamagePerMinute':1000},'equipment_slots':[{'index':0,'slot':{'categories':['scouting']}}]}}),
+        'equipment_compatibility':section({'1':{'vehicle_id':100,'equipment':{'80':{'slots':[{'allowed':False},{'allowed':True}],'installed':True}}}}),'equipment_removal_costs':section({'80':{'gold':10}})}
+    d={'session':'fixture','game_version':version,'sampled_at':time.time(),'account':{},'sections':sections}; c={'session':'fixture','game_version':version,'data':{'selected_tank':{'tank_id':100,'name':'Fixture tank','tier':3}},'schema':1,'connector_version':'0.0.8','game_state':'stopped'}
+    put(root/'connector'/'diagnostics.json',d); put(root/'connector'/'connector.json',c)
+    return d,c,vehicle,folder
+with tempfile.TemporaryDirectory() as tmp:
+    root=Path(tmp); d,c,v,folder=fixture(root); g=Garage(root); g.refresh(d,c,'garage')
+    assert len(g.vehicles)==1 and g.by_type['100']==['1']
+    assert ('Spotting','View range','300 m','320 m') in g.overview(v)
+    assert any(r[1]=='Engine B' and r[2]=='Researched' and r[3]=='1' and '400' in r[5] for r in g.modules(v))
+    assert any(r[1]=='Gun B' and r[-1]=='Requires another turret' for r in g.modules(v))
+    slots=g.crew_slots(d['sections']['crew']['data']['1'])
+    assert len([r for r in slots if r[1].startswith('Bonus')])==9
+    assert any(r[0]=='loader' and r[1]=='Bonus 1' and r[-1]=='Available to select' for r in slots)
+    assert any(r[0]=='radioman' and r[1]=='Bonus 3' and r[-1]=='Locked' for r in slots)
+    assert any(r[2]=='Concealment' for r in slots)
+    assert g.inventory('LOOT_BOX',1) is None and g.inventory('OPTIONALDEVICE',80)==0
+    assert any(r[0]=='AP shell' and r[2]=='100' and r[4]=='60 / 45' for r in g.ammunition(v))
+    assert any(r[0]=='HE shell' and r[2]=='0' for r in g.ammunition(v))
+    assert any(r[1]=='Optics' and r[2]=='Mounted' for r in g.equipment(v))
+    assert any(r[1]=='Repair kit' and r[2]=='3' and '3,000' in r[3] for r in g.consumables(v))
+    assert any(r[0]=='Next tank' and r[2]=='Available to research' for r in g.progression(v))
+    assert g.depot_rows('LOOT_BOX')[0][2]=='Unknown'
+    # Corrupt category is not silently trusted.
+    (folder/'ammunition.json').write_text('{}'); g.catalogue.rows.clear()
+    assert not g.catalogue.category('ammunition')
+    assert g.catalogue.errors
+    g.refresh(d,dict(c,session='different'),'garage'); assert not g.vehicles
+    # Derived cache and previous schema compatibility.
+    loader=importlib.machinery.SourceFileLoader('quartermaster','desktop/WoTQuartermaster_v0.3.0.txt')
+    spec=importlib.util.spec_from_loader(loader.name,loader); m=importlib.util.module_from_spec(spec); loader.exec_module(m)
+    model=m.Model(root); model.poll(True)
+    assert model.store.db.execute('SELECT count(*) FROM garage_inventory').fetchone()[0]==1
+    model.store.reset(); assert (root/'connector'/'diagnostics.json').exists()
+    model.close()
+print('Garage fixture: session checks, stock/current, modules, nine bonus slots, available/locked, unknown/zero inventory, ammo, equipment, consumables, research, catalogue integrity, SQLite reset passed')

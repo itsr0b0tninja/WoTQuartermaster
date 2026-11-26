@@ -1,0 +1,109 @@
+name: Build WoTQuartermaster desktop 0.3.0
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/desktop-0.3.0-release.yml'
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: desktop-release-0.3.0
+  cancel-in-progress: false
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          architecture: x64
+      - name: Install build dependencies
+        run: python -m pip install --disable-pip-version-check PySide6==6.8.3 Pillow==11.3.0 PyInstaller==6.14.2
+      - name: Syntax and updater safety checks
+        shell: pwsh
+        run: |
+          $actual = (git hash-object desktop/WoTQuartermaster_v0.3.0.txt).Trim()
+          if ($actual -ne '6187ade3825119ebd3252ba261526592c30d4a46') { throw 'Source hash mismatch' }
+          if ((git hash-object desktop/garage_data.py).Trim() -ne '1ff3095054cbae5e940e58bac6ee2752fd865ced') { throw 'Garage source hash mismatch' }
+          Copy-Item desktop/garage_data.py garage_data.py
+          Copy-Item desktop/WoTQuartermaster_v0.3.0.txt WoTQuartermaster.py
+          python -m py_compile WoTQuartermaster.py
+          if ($LASTEXITCODE -ne 0) { throw 'Syntax failed' }
+          python desktop/test_updater_v0.3.0.txt
+          if ($LASTEXITCODE -ne 0) { throw 'Updater safety checks failed' }
+          python desktop/test_garage_v0.3.0.txt
+          if ($LASTEXITCODE -ne 0) { throw 'Garage fixture checks failed' }
+          python WoTQuartermaster.py --check-data "${{ runner.temp }}/quartermaster-empty-test"
+          if ($LASTEXITCODE -ne 0) { throw 'Data check failed' }
+      - name: Compile standalone Windows executable
+        shell: pwsh
+        run: |
+          python -m PyInstaller --noconfirm --clean --onefile --windowed --name WoTQuartermaster --hidden-import PIL.DdsImagePlugin WoTQuartermaster.py
+          if ($LASTEXITCODE -ne 0) { throw 'Build failed' }
+          $file = Get-Item dist/WoTQuartermaster.exe
+          if ($file.Length -lt 100000) { throw 'Executable too small' }
+          $stream = [System.IO.File]::OpenRead($file.FullName)
+          try { if ($stream.ReadByte() -ne 77 -or $stream.ReadByte() -ne 90) { throw 'Invalid PE executable' } } finally { $stream.Dispose() }
+      - name: Smoke test compiled executable
+        shell: pwsh
+        run: |
+          $testDir = Join-Path $env:RUNNER_TEMP 'quartermaster-updater-smoke'
+          New-Item -ItemType Directory -Force $testDir | Out-Null
+          Copy-Item dist/WoTQuartermaster.exe $testDir
+          $env:QT_QPA_PLATFORM = 'offscreen'
+          $proc = Start-Process -FilePath (Join-Path $testDir 'WoTQuartermaster.exe') -WorkingDirectory $testDir -PassThru
+          try {
+            Start-Sleep -Seconds 20
+            $proc.Refresh()
+            if ($proc.HasExited) { throw "Desktop startup failed: $($proc.ExitCode)" }
+            if (!(Test-Path (Join-Path $testDir 'data/database/quartermaster.sqlite3'))) { throw 'Database not created' }
+            $log = Join-Path $testDir 'logs/desktop.log'
+            if ((Test-Path $log) -and (Select-String -Path $log -Pattern 'Fatal desktop error|Refresh failed' -Quiet)) { Get-Content $log; throw 'Desktop startup errors' }
+          } finally {
+            Get-Process WoTQuartermaster -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+          }
+      - name: Real Windows update and reverse replacement
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          New-Item -ItemType Directory -Force prior | Out-Null
+          gh release download v0.2.1 --repo $env:GITHUB_REPOSITORY --pattern WoTQuartermaster.exe --dir prior
+          if ($LASTEXITCODE -ne 0) { throw 'Previous release download failed' }
+          python desktop/test_compiled_update_v0.3.0.txt prior/WoTQuartermaster.exe dist/WoTQuartermaster.exe
+          if ($LASTEXITCODE -ne 0) { throw 'Compiled update cycle failed' }
+      - name: Publish verified desktop release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $exe = 'dist/WoTQuartermaster.exe'
+          $digest = (Get-FileHash $exe -Algorithm SHA256).Hash.ToLowerInvariant()
+          Set-Content -Path dist/WoTQuartermaster.sha256.txt -Value "$digest  WoTQuartermaster.exe" -Encoding ascii
+          gh release view v0.3.0 --repo $env:GITHUB_REPOSITORY 2>$null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create v0.3.0 --repo $env:GITHUB_REPOSITORY --target $env:GITHUB_SHA --title "WoTQuartermaster v0.3.0 Alpha" --prerelease --notes "Garage and inventory alpha: vehicle browser with follow/manual selection, stock and configured stats, modules, primary and secondary crew perks, equipment, ammo, consumables, direct research paths, depot and derived SQLite inventory cache. No recommendation engine or hypothetical configuration calculations yet. Existing Connector and replay components unchanged. Update in-app with the game closed." $exe dist/WoTQuartermaster.sha256.txt
+            if ($LASTEXITCODE -ne 0) { throw 'Desktop release failed' }
+          }
+      - name: Publish component manifest after releases exist
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git fetch origin main
+          git checkout -B main origin/main
+          python .github/scripts/publish_components_0_3_0.py
+          if ($LASTEXITCODE -ne 0) { throw 'Manifest generation failed' }
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add components.json
+          git diff --cached --quiet
+          if ($LASTEXITCODE -ne 0) {
+            git commit -m "Publish verified component manifest for desktop 0.3.0"
+            if ($LASTEXITCODE -ne 0) { throw 'Manifest commit failed' }
+            git push origin main
+            if ($LASTEXITCODE -ne 0) { throw 'Manifest publication failed' }
+          }
