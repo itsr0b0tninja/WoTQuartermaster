@@ -39,7 +39,7 @@ jobs:
           python desktop/test_updater_v0.3.1.txt
           if ($LASTEXITCODE -ne 0) { throw 'Updater safety checks failed' }
           python desktop/test_modules_v0.3.1.txt
-          if ($LASTEXITCODE -ne 0) { throw 'Garage fixture checks failed' }
+          if ($LASTEXITCODE -ne 0) { throw 'Module fixture checks failed' }
           python WoTQuartermaster.py --check-data "${{ runner.temp }}/quartermaster-empty-test"
           if ($LASTEXITCODE -ne 0) { throw 'Data check failed' }
       - name: Compile standalone Windows executable
