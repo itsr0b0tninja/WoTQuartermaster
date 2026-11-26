@@ -18,11 +18,11 @@
       "asset": "WoTQuartermaster.exe",
       "channel": "alpha",
       "min_desktop": "0.2.0",
-      "release": "v0.3.0",
-      "sha256": "71efa8af23dc743ac0bd3e09c72a1edc2a3d39952b6cb7759ab737ecb76f48ef",
-      "size": 55737487,
-      "url": "https://github.com/itsr0b0tninja/WoTQuartermaster/releases/download/v0.3.0/WoTQuartermaster.exe",
-      "version": "0.3.0"
+      "release": "v0.3.1",
+      "sha256": "576a1f0e97d70d7cba83051e263b78f7638c2afc7e4f5f225afd8fdd30671787",
+      "size": 55731969,
+      "url": "https://github.com/itsr0b0tninja/WoTQuartermaster/releases/download/v0.3.1/WoTQuartermaster.exe",
+      "version": "0.3.1"
     },
     "replay_parser": {
       "asset": "WoT_Quartermaster_Replay_Parser.txt",
