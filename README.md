@@ -6,9 +6,15 @@ A work-in-progress, portable Windows second-monitor companion for World of Tanks
 
 - Connector 0.0.8: live garage, catalogue, battle results and battle context (map/team/vehicle), exported locally.
 - Replay importer 0.0.7: local replay import, deduplication and reconciliation.
-- Desktop application: not yet released.
+- Desktop application 0.1.0: initial Windows alpha, built through GitHub Actions.
 
 The Connector has been tested in World of Tanks EU 2.4.2.0; compatibility with other client builds is not guaranteed. Battle context was verified on two battles on the same map and team. These are development components, not a finished advisor.
+
+## Desktop alpha
+
+See the [releases page](https://github.com/itsr0b0tninja/WoTQuartermaster/releases) for the Windows executable. Place `WoTQuartermaster.exe` in the portable project folder beside your existing `data/` directory, or select that directory in Settings. Keep the tested Connector 0.0.8 installed; the desktop app does not modify the game. Open the app on a second monitor and start World of Tanks. The app displays garage resources, detects live battle context and selects the extracted minimap automatically. The map atlas can also be browsed manually. Settings, SQLite cache and logs are stored locally; the one-file executable uses temporary runtime extraction. No Python installation is required.
+
+The recommendation engines, integrated updates and automatic replay imports are not yet implemented. The desktop alpha is for testing the foundation, not a complete advisor.
 
 ## Connector installation (development build)
 
