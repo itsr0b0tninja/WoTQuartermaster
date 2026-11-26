@@ -1,0 +1,73 @@
+name: Build WoTQuartermaster desktop 0.1.0
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/desktop-release.yml'
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: desktop-release-0.1.0
+  cancel-in-progress: false
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          architecture: x64
+      - name: Install pinned build dependencies
+        run: python -m pip install --disable-pip-version-check PySide6==6.8.3 Pillow==11.3.0 PyInstaller==6.14.2
+      - name: Verify source and run basic data checks
+        shell: pwsh
+        run: |
+          $actual = (git hash-object desktop/WoTQuartermaster_v0.1.0.txt).Trim()
+          if ($actual -ne 'ce2c0b488fe0eedfb345c07b7f09ba7525bef97f') { throw 'Source hash mismatch' }
+          Copy-Item desktop/WoTQuartermaster_v0.1.0.txt WoTQuartermaster.py
+          python -m py_compile WoTQuartermaster.py
+          if ($LASTEXITCODE -ne 0) { throw 'Syntax check failed' }
+          python WoTQuartermaster.py --check-data "${{ runner.temp }}/quartermaster-empty-test"
+          if ($LASTEXITCODE -ne 0) { throw 'Local data check failed' }
+      - name: Compile standalone Windows executable
+        shell: pwsh
+        run: |
+          python -m PyInstaller --noconfirm --clean --onefile --windowed --name WoTQuartermaster --hidden-import PIL.DdsImagePlugin WoTQuartermaster.py
+          if ($LASTEXITCODE -ne 0) { throw 'Build failed' }
+          $file = Get-Item dist/WoTQuartermaster.exe
+          if ($file.Length -lt 100000) { throw 'Executable too small' }
+          $stream = [System.IO.File]::OpenRead($file.FullName)
+          try { if ($stream.ReadByte() -ne 77 -or $stream.ReadByte() -ne 90) { throw 'Invalid PE executable' } } finally { $stream.Dispose() }
+      - name: Smoke test executable with empty local data
+        shell: pwsh
+        run: |
+          $testDir = Join-Path $env:RUNNER_TEMP 'quartermaster-desktop-smoke'
+          New-Item -ItemType Directory -Force $testDir | Out-Null
+          Copy-Item dist/WoTQuartermaster.exe $testDir
+          $env:QT_QPA_PLATFORM = 'offscreen'
+          $proc = Start-Process -FilePath (Join-Path $testDir 'WoTQuartermaster.exe') -WorkingDirectory $testDir -PassThru
+          try {
+            Start-Sleep -Seconds 20
+            $proc.Refresh()
+            if ($proc.HasExited) { throw "Application exited during startup: $($proc.ExitCode)" }
+            if (!(Test-Path (Join-Path $testDir 'data/database/quartermaster.sqlite3'))) { throw 'Local database not created' }
+            $log = Join-Path $testDir 'logs/desktop.log'
+            if ((Test-Path $log) -and (Select-String -Path $log -Pattern 'Fatal desktop error|Refresh failed' -Quiet)) { Get-Content $log; throw 'Application reported startup errors' }
+          } finally {
+            Get-Process WoTQuartermaster -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+          }
+      - name: Generate checksum and publish alpha
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $exe = 'dist/WoTQuartermaster.exe'
+          $digest = (Get-FileHash $exe -Algorithm SHA256).Hash.ToLowerInvariant()
+          Set-Content -Path dist/WoTQuartermaster.sha256.txt -Value "$digest  WoTQuartermaster.exe" -Encoding ascii
+          gh release view v0.1.0 --repo $env:GITHUB_REPOSITORY 2>$null
+          if ($LASTEXITCODE -eq 0) { Write-Host 'Alpha already exists; leaving existing release unchanged'; exit 0 }
+          gh release create v0.1.0 --repo $env:GITHUB_REPOSITORY --target $env:GITHUB_SHA --title "WoTQuartermaster v0.1.0 Alpha" --prerelease --notes "First portable Windows x64 desktop test release. Requires existing Connector 0.0.8 data for live integration. Place the EXE beside the existing data folder, or configure the data directory in Settings. Includes live connection and account status, garage snapshot, automatic battle map switching, manual atlas, local settings and SQLite cache. Recommendation engines, automatic replay importing and component downloads are deferred. Compiled and smoke-tested in CI; live gameplay and multi-monitor behaviour still require user testing." $exe dist/WoTQuartermaster.sha256.txt
+          if ($LASTEXITCODE -ne 0) { throw 'Release publication failed' }
