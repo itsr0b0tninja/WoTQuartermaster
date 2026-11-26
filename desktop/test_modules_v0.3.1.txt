@@ -73,7 +73,7 @@ with tempfile.TemporaryDirectory() as tmp:
     assert r.ready(),r.errors
     assert len(r.loaded)==5
     for mid,mod in r.loaded.items():
-        assert Path(mod.__file__).resolve()==base/'modules'/(mid+'.qmodule')
+        assert Path(mod.__file__).samefile(base/'modules'/(mid+'.qmodule'))
     assert {t['title'] for t in r.tab_specs('vehicle')}=={'Overview','Modules','Crew','Equipment','Ammo','Consumables','Research'}
     assert {p['name'] for p in r.pages}=={'Garage','Depot','Progression','Map atlas','Battle'}
     folder=base/'modules'
