@@ -1,0 +1,75 @@
+name: Build WoTQuartermaster 0.5.0 Financial Advisor
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/desktop-0.5.0-release.yml'
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: module-manifest-publication
+  cancel-in-progress: false
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          architecture: x64
+      - name: Install build dependencies
+        run: python -m pip install --disable-pip-version-check PySide6==6.8.3 Pillow==11.3.0 PyInstaller==6.14.2
+      - name: Verify source and run regression tests
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ((git hash-object desktop/WoTQuartermaster_v0.5.0.txt).Trim() -ne '0d07e529c0c6df2a1df3f43e3171aa68e8a54795') { throw 'Core source hash mismatch' }
+          if ((git hash-object modules/battle_performance/0.1.2/battle_performance.qmodule).Trim() -ne '759b22ecba369a3fe1b7f1f52b22067294cadcb1') { throw 'Module source hash mismatch' }
+          if ((git hash-object modules/finance/0.1.0/finance.qmodule).Trim() -ne '5059f94471e2c2df26f74db88bcea18890aa31e3') { throw 'Finance source hash mismatch' }
+          python .github/scripts/build_module_index_0_3_2.py
+          if ($LASTEXITCODE -ne 0) { throw 'Index generation failed' }
+          Copy-Item desktop/module_manager_online.py module_manager_online.py
+          Copy-Item desktop/module_manager.py module_manager.py
+          Copy-Item desktop/module_runtime.py module_runtime.py
+          Copy-Item desktop/module_shared.py module_shared.py
+          Copy-Item desktop/WoTQuartermaster_v0.5.0.txt WoTQuartermaster.py
+          python -m py_compile WoTQuartermaster.py
+          if ($LASTEXITCODE -ne 0) { throw 'Syntax failed' }
+          (Get-Content desktop/test_updater_v0.3.3.txt -Raw).Replace('desktop/WoTQuartermaster_v0.3.3.txt','desktop/WoTQuartermaster_v0.5.0.txt') | Set-Content -Encoding utf8 test-updater-041.py
+          python test-updater-041.py
+          if ($LASTEXITCODE -ne 0) { throw 'Updater regression failed' }
+          python .github/scripts/publish_0_5_0.py
+          if ($LASTEXITCODE -ne 0) { throw 'Battle module tests failed' }
+          python .github/scripts/publish_0_5_0.py --ui
+          if ($LASTEXITCODE -ne 0) { throw 'Financial advisor UI checks failed' }
+      - name: Compile portable Windows executable
+        shell: pwsh
+        run: |
+          python -m PyInstaller --noconfirm --clean --onefile --windowed --name WoTQuartermaster --hidden-import PIL.DdsImagePlugin --hidden-import PIL.Image --hidden-import PIL.PngImagePlugin --add-data "desktop/runtime_modules/index.json;runtime_modules" WoTQuartermaster.py
+          if ($LASTEXITCODE -ne 0) { throw 'Build failed' }
+          $exe = 'dist/WoTQuartermaster.exe'
+          $digest = (Get-FileHash $exe -Algorithm SHA256).Hash.ToLowerInvariant()
+          Set-Content -Path dist/WoTQuartermaster.sha256.txt -Value "$digest  WoTQuartermaster.exe" -Encoding ascii
+      - name: Verify real compiled upgrade and module activation
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python .github/scripts/publish_0_5_0.py --compiled
+      - name: Publish verified core and module
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git fetch origin main
+          git checkout -B main origin/main
+          python .github/scripts/publish_0_5_0.py --publish
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add components.json
+          if ! git diff --cached --quiet; then
+            git commit -m "Publish verified WoTQuartermaster 0.5.0 core and advisor modules"
+            git push origin main
+          fi

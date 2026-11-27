@@ -1,0 +1,282 @@
+# WoTQuartermaster Financial Advisor 0.1.0 — read-only, credits per battle.
+import math, statistics, time, json, re
+from pathlib import Path
+from module_shared import obj, seq, name
+MODULE={'id':'finance','version':'0.1.0','api':1,'min_core':'0.5.0','dependencies':{'battle_performance':'0.1.2'}}
+MODES={'random_pvp':'Random PvP','ai_or_mixed':'AI / mixed'}
+CLASSES={'lighttank':'Hybrid Scout','mediumtank':'Flanker','heavytank':'Brawler','at-spg':'Concealed Sniper','spg':'Artillery Support'}
+def amount(x):
+    return x if type(x) in (int,float) and math.isfinite(x) and x>=0 else None
+def signed(x):
+    return x if type(x) in (int,float) and math.isfinite(x) else None
+def sum_known(*xs):
+    return sum(xs) if all(x is not None for x in xs) else None
+def credit_array(v):
+    # Client money arrays: index zero is credits, remaining currencies are separate.
+    return amount(v[0]) if isinstance(v,list) and v else None
+def cash_money(v):
+    if not isinstance(v,dict) or amount(v.get('credits')) is None: return None
+    if any(k!='credits' and amount(x)!=0 and x is not None for k,x in v.items()): return None
+    return v['credits']
+def quantile(xs,q):
+    if not xs: return None
+    a=sorted(xs); i=(len(a)-1)*q; lo=int(i); hi=min(lo+1,len(a)-1)
+    return a[lo]+(a[hi]-a[lo])*(i-lo)
+def finance_row(r):
+    p=obj(r.get('personal')); e=obj(r.get('raw')); avatar=obj(obj(obj(e.get('data')).get('personal')).get('avatar'))
+    original=amount(p.get('originalCredits')); subtotal=amount(p.get('subtotalCredits'))
+    repair=amount(p.get('autoRepairCost')); ammo=credit_array(p.get('autoLoadCost')); consumables=credit_array(p.get('autoEquipCost'))
+    booster=credit_array(p.get('autoEquipBoostersCost'))
+    # autoRepairCost is the actual automatic debit; repair is not an additional debit.
+    cost=sum_known(repair,ammo,consumables,booster)
+    factor=amount(p.get('appliedPremiumCreditsFactor100'))
+    # Base reward before personal/clan/quest modifiers. Validate the premium-only subtotal
+    # against the original and actual applied factor; no guessed division of total credits.
+    premium=None
+    if original is not None and factor in (100,150):
+        predicted=math.floor(original*factor/100+0.5)
+        if subtotal is not None and abs(subtotal-predicted)<=1 and not any(amount(p.get(k)) not in (None,0) for k in ('orderCreditsFactor100','wotPlusProBoostCreditsFactor100','originalPremSquadCredits')):
+            premium=subtotal
+        elif factor==100: premium=original
+    # Penalty/contribution are battle-related but their inclusion in originalCredits is
+    # not established for nonzero records; exclude these from recurring forecasts.
+    adjustment=any(amount(p.get(k)) not in (None,0) for k in ('creditsPenalty','creditsContributionIn','creditsContributionOut','creditsToDraw'))
+    reward=amount(avatar.get('eventCredits'))
+    if reward is None: reward=amount(p.get('eventCredits'))
+    total=amount(avatar.get('credits'))
+    if total is None: total=amount(p.get('credits'))
+    valid=bool(r.get('eligible') and r.get('at') is not None and r.get('vehicle') and r.get('mode') in MODES and not adjustment and cost is not None and original is not None)
+    # Standard-account earnings are a conservative observed cash-cost baseline.
+    # No assumption about inventory consumption where auto-resupply didn't charge.
+    standard=original-cost if valid else None
+    prem_est=math.floor(original*1.5+0.5)-cost if valid else None
+    actual=total-cost if r.get('eligible') and total is not None and cost is not None else None
+    return dict(id=r.get('id'),account=r.get('account'),at=r.get('at'),vehicle=r.get('vehicle'),vehicle_name=r.get('vehicle_name'),mode=r.get('mode'),style=r.get('style') or 'Unclassified',objective=r.get('objective') or 'Unclassified',purpose=r.get('purpose') or 'Unknown',standard=standard,premium_est=prem_est,current_reported=premium-cost if valid and premium is not None else None,actual=actual,original=original,gross=total,reward=reward,repair=repair,ammo=ammo,consumables=consumables,booster=booster,cost=cost,eligible=valid,status='Recurring credit estimate' if valid else 'Incomplete / disputed / unsupported')
+def sample(rows,premium=False):
+    key='premium_est' if premium else 'standard'
+    a=sorted([r for r in rows if r.get(key) is not None],key=lambda r:(r['at'],str(r['id'])),reverse=True)[:50]
+    x=[r[key] for r in a]; costs=[r['cost'] for r in a]; n=len(x)
+    if not n: return dict(n=0,average=None,recent=None,low=None,high=None,reserve=None,cost=None,positive=None,classification='Insufficient data')
+    mean=statistics.mean(x); c=statistics.mean(costs)
+    positive=sum(v>0 for v in x)/n
+    cls='Insufficient data' if n<5 else 'Break-even' if abs(mean)<=.1*c else 'Loss-making' if mean<0 else 'Consistently profitable' if positive>=.8 else 'Profitable'
+    return dict(n=n,average=mean,recent=statistics.mean(x[:20]),low=min(mean,quantile(x,.25),statistics.mean(r['standard'] for r in a)) if premium else min(mean,quantile(x,.25)),high=max(mean,quantile(x,.75)),reserve=math.ceil(max(10*c,5*quantile(costs,.9))),cost=c,positive=positive,classification=cls,standard=statistics.mean(r['standard'] for r in a),premium=statistics.mean(r['premium_est'] for r in a))
+def forecast(balance,purchase,reserve,profile,switch_cost=0):
+    if any(amount(x) is None for x in (balance,purchase,reserve,switch_cost)):
+        return dict(target=None,shortfall=None,optimistic=None,expected=None,conservative=None)
+    target=purchase+reserve+switch_cost; gap=max(0,target-balance)
+    def games(rate):
+        return 0 if gap==0 else math.ceil(gap/rate) if profile.get('n',0)>=5 and signed(rate) is not None and rate>0 else None
+    return dict(target=target,shortfall=gap,optimistic=games(profile.get('high')),expected=games(profile.get('average')),conservative=games(profile.get('low')))
+def quote_inventory(context,requirements):
+    # Future configuration advisor supplies verified fit + quantity + purchase price.
+    # Allocate depot once, never strip another tank or assume unknown stock is free.
+    stock=obj(context.section('depot')); used={}; lines=[]; total=0
+    for req in requirements:
+        cat=req.get('category'); cd=str(req.get('id')); n=amount(req.get('quantity')); k=(cat,cd)
+        raw=stock.get(cat); available=amount(raw.get(cd,0)) if isinstance(raw,dict) else None
+        price=cash_money(req.get('price'))
+        if n is None or available is None or req.get('compatible') is not True:
+            cost=None; reuse=None
+        else:
+            reuse=min(n,max(0,available-used.get(k,0))); used[k]=used.get(k,0)+reuse
+            cost=0 if reuse==n else (n-reuse)*price if price is not None else None
+        lines.append(dict(category=cat,id=cd,quantity=n,reuse=reuse,cash_cost=cost))
+        total=sum_known(total,cost)
+    return dict(cash_cost=total,lines=lines)
+def role(v):
+    return CLASSES.get(str(v.get('type','')).lower()) or CLASSES.get(str(v.get('type','')).lower().replace(' ','').replace('_',''))
+def ready(v):
+    # An unknown readiness field does not imply the vehicle is ready.
+    return (v.get('isLocked') is False and v.get('isRented') is not True and bool(obj(obj(v.get('modules')).get('gun')).get('intCD')) and
+            isinstance(v.get('crew_slots'),list) and bool(v['crew_slots']) and all(obj(s).get('crew_id') is not None for s in v['crew_slots']) and
+            any(amount(obj(s).get('count')) not in (None,0) for s in seq(v.get('shells_layout'))))
+def profiles(rows,vehicles,mode,objective,premium):
+    out=[]
+    for v in vehicles:
+        vid=str(v.get('intCD')); rr=[r for r in rows if r['vehicle']==vid and r['mode']==mode]
+        generic=sample(rr,premium)
+        styles={s:sample([r for r in rr if r['style']==s],premium) for s in sorted({r['style'] for r in rr if r['style']!='Unclassified'})}
+        known=[(s,p) for s,p in styles.items() if p['n']>=5]
+        if objective=='Profit':
+            style,prof=max(known,key=lambda x:(x[1]['average'],x[1]['n'])) if known else (role(v),generic)
+            scope='Recorded combat role' if known else 'Vehicle-wide fallback; role provisional'
+        elif objective in styles and styles[objective]['n']>=5:
+            style,prof=objective,styles[objective]; scope='Recorded career playstyle'
+        else:
+            style,prof=objective,generic; scope='Vehicle-wide fallback'
+        out.append(dict(vehicle=vid,name=name(v,'Vehicle '+vid),style=style or 'Unclassified',profile=prof,vehicle_profile=generic,styles=styles,scope=scope,ready=ready(v),tier=v.get('level'),configured=sum(x is not None for x in seq(v.get('optDevices')))))
+    return out
+def choose(ps,selected,objective,balance=None,goal=None):
+    usable=[p for p in ps if p['ready'] and p['profile']['n']>=5 and p['profile']['average']>0]
+    current=next((p for p in usable if p['vehicle']==selected),None)
+    def cost(p):
+        # No automatic spending or transfers. Candidate already has ammunition, gun and crew.
+        return forecast(balance,goal, p['profile']['reserve'],p['profile'])['expected'] if goal is not None else None
+    ranked=sorted(usable,key=lambda p:(cost(p) is None,cost(p) or 0,-p['profile']['average'],p['vehicle'])) if goal is not None else sorted(usable,key=lambda p:(-p['profile']['average'],-p['profile']['n'],p['vehicle']))
+    if ranked:
+        best=ranked[0]
+        if current and best['vehicle']!=selected:
+            if best['profile']['average']<current['profile']['average']*1.05 or (goal is not None and cost(current) is not None and (cost(best) is None or cost(best)>=cost(current))):
+                best=current
+        # Explore an untested ready vehicle after each 20 completed observations of
+        # the leading profile, using a bounded 5-battle discovery block.
+        discovery=[p for p in ps if p['ready'] and p['vehicle']!=best['vehicle'] and p['profile']['n']<5]
+        total=sum(p['vehicle_profile']['n'] for p in ps)
+        if objective=='Profit' and discovery and best['profile']['n']>=20 and total%20<5:
+            best=sorted(discovery,key=lambda p:(p['profile']['n']==0,p['tier'] if amount(p['tier']) is not None else 99,-p['configured'],p['vehicle']))[0]
+            return best,'Discovery: test this ready vehicle; profitability is not established.'
+        return best,'Established estimate' if best['profile']['n']>=20 else 'Preliminary estimate'
+    if objective!='Profit': return None,'No profitable comparable vehicle has enough data.'
+    candidates=[p for p in ps if p['ready'] and p['profile']['n']<5]
+    if candidates:
+        best=min(candidates,key=lambda p:(p['vehicle']!=selected,p['tier'] if amount(p['tier']) is not None else 99,-p['configured'],p['vehicle']))
+        return best,'Discovery: collect five comparable battles; most profitable vehicle is not yet known.'
+    return None,'No confirmed battle-ready candidate with positive recurring earnings.'
+def target_options(m):
+    owned={str(v.get('intCD')) for v in m.garage}; result={}
+    paths=obj(obj(m.garage_data.section('progression')).get('owned_vehicle_paths'))
+    for v in m.garage:
+        path=obj(paths.get(str(v.get('invID'))))
+        if str(path.get('vehicle_id'))!=str(v.get('intCD')): continue
+        for e in seq(path.get('edges')):
+            t=obj(e.get('target')); cd=str(e.get('target_id'))
+            if cd in owned or cd=='None' or not (t.get('item_type_name')=='vehicle' or t.get('tier') is not None): continue
+            price=cash_money(t.get('personal_discount_price'))
+            if price is None: price=cash_money(t.get('buy'))
+            result[cd]=dict(id=cd,name=name(t,'Vehicle '+cd),price=price,unlocked=e.get('unlocked') is True or e.get('default_unlock') is True,source=str(v.get('intCD')),xp=e.get('xp_raw'))
+    return result
+def account_key(w):
+    m=w.model
+    c=obj(m.sources.get('battle_context'))
+    conn=obj(m.sources.get('connector'))
+    if c.get('session')==conn.get('session') and isinstance(c.get('account_key'),str) and re.fullmatch('[0-9a-f]{24}',c['account_key']): return c['account_key']
+    # Only latest explicitly observed identity, never combine accounts.
+    if m.state=='closed': return getattr(w,'bp_latest_account',None)
+    return None
+def premium_basis(m,strategy):
+    expiry=amount(m.account.get('premium_expiry'))
+    return strategy=='Current account' and m.account.get('premium') is True and expiry is not None and expiry>time.time()
+def fmt(x):
+    return '—' if x is None else f'{x:,.0f}' if type(x) in (int,float) else str(x)
+def make_finance(w):
+    p,l=page(); heading(l,'Financial Advisor','Credits per completed battle · recurring earnings exclude missions and quests')
+    w.fin_note=label('Waiting for verified account and battle history','Subheading',True); l.addWidget(w.fin_note)
+    row=QHBoxLayout(); row.addWidget(label('Battle type')); w.fin_mode=QComboBox(); w.fin_mode.addItem('Latest recorded battle type','auto')
+    for k,v in MODES.items(): w.fin_mode.addItem(v,k)
+    row.addWidget(w.fin_mode); l.addLayout(row)
+    w.fin_tabs=QTabWidget(); l.addWidget(w.fin_tabs,1); w.fin_tables={}
+    for title,headers in [('Overview',['Financial measure','Value']),('Vehicles',['Vehicle','Combat role / basis','Battles','Standard net','Premium estimate','Last 20','Cost','Reserve','Profitable','Assessment']),('Transactions',['Battle / date','Vehicle','Mode','Objective','Base gross','Total gross','Rewards','Repair','Ammo','Consumables','Booster cost','Actual net','Status']),('Forecast',['Vehicle','Purchase only + reserve','Shortfall','Optimistic','Expected','Conservative','Scope'])]:
+        widget,lay=page()
+        if title=='Forecast':
+            w.fin_target=QComboBox(); w.fin_target.addItem('Select a research-path vehicle (optional)',None); lay.addWidget(w.fin_target)
+            w.fin_forecast_note=label('Purchase price only; configuration and crew costs pending future advisor.',wrap=True); lay.addWidget(w.fin_forecast_note)
+        t=w.data_table(headers); w.fin_tables[title]=t; lay.addWidget(t,1); w.fin_tabs.addTab(widget,title)
+    w.fin_mode.currentIndexChanged.connect(lambda _:refresh_finance(w,True)); w.fin_target.currentIndexChanged.connect(lambda _:refresh_finance(w,True))
+    w.fin_cache=None; w.fin_rows=[]; w.fin_stamp=None; w.fin_targets={}; w.fin_account=None
+    w.add_page('Finance',p)
+def reset_finance(w):
+    w.fin_cache=None; w.fin_rows=[]; w.fin_stamp=None; w.fin_targets={}; w.fin_account=None; w.finance_battle_intent=None
+def refresh_finance(w,force=False):
+    if not hasattr(w,'fin_mode') or not w.model: return
+    m=w.model; settings=w.settings.values; objective=settings['playstyle']; strategy=settings['strategy']; advisor=settings.get('advisor_mode','Full Advisor')
+    if m.state in {'matchmaking','battle_loading','in_battle'}: return
+    account=account_key(w); records=getattr(w,'bp_rows',[])
+    stamp=(str(m.root),account,id(records))
+    if stamp!=w.fin_cache:
+        w.fin_cache=stamp; w.fin_rows=[finance_row(r) for r in records if account and r.get('account')==account]
+    rows=w.fin_rows
+    modes=[r for r in rows if r['mode'] in MODES and r['at'] is not None]
+    mode=w.fin_mode.currentData()
+    if mode=='auto': mode=max(modes,key=lambda r:r['at'])['mode'] if modes else 'random_pvp'
+    premium=premium_basis(m,strategy); balance=amount(m.account.get('credits'))
+    selected=str(m.selected.get('tank_id') or '')
+    targets=target_options(m); prior=w.fin_target.currentData()
+    if targets!=w.fin_targets:
+        w.fin_targets=targets; w.fin_target.blockSignals(True); w.fin_target.clear(); w.fin_target.addItem('Select a research-path vehicle (optional)',None)
+        for cd,t in sorted(targets.items(),key=lambda x:x[1]['name']): w.fin_target.addItem(t['name']+(' · researched' if t['unlocked'] else ' · not researched'),cd)
+        w.fin_target.setCurrentIndex(max(0,w.fin_target.findData(prior))); w.fin_target.blockSignals(False)
+    t=targets.get(w.fin_target.currentData(),{}); target=t.get('price')
+    stamp=(w.fin_cache,m.garage_signature,objective,strategy,advisor,mode,premium,balance,selected,w.fin_target.currentData(),m.state,bool(getattr(w,'finance_requested',False)))
+    if stamp==w.fin_stamp and not force:
+        if objective=='Profit' and hasattr(w,'atlas_style_label') and w.finance_battle_intent:
+            w.atlas_style_label.setText('Objective: Profit · Combat role: '+w.finance_battle_intent['style']+' · Tactical recommendations arrive in v0.8.0.')
+        return
+    ps=profiles(rows,m.garage,mode,objective,premium)
+    current=next((x for x in ps if x['vehicle']==selected),None); prof=current['profile'] if current else sample([],premium)
+    actionable=m.state=='garage' and bool(account) and balance is not None
+    # A user-selected researched target is a provisional finance objective only.
+    # The future progression service will supply the career-specific target and total setup cost.
+    grinding=bool(t.get('unlocked') and target is not None and prof.get('reserve') is not None and balance is not None and balance<target+prof['reserve'])
+    best,reason=choose(ps,selected,objective,balance,target if grinding and objective!='Profit' else None)
+    w.fin_stamp=stamp
+    basis='Premium-only estimate (active now; expiry not forecast)' if premium else 'Standard account / F2P'
+    note=MODES[mode]+' · '+basis+' · '+str(sum(r['eligible'] and r['mode']==mode for r in rows))+' complete financial records'
+    if not account: note+=' · Account identity not confirmed; history withheld'
+    w.fin_note.setText(note+' · Costs are reported auto-resupply debits; uncharged depot use is not valued.')
+    w.set_rows(w.fin_tables['Overview'],[(k,fmt(v)) for k,v in [('Credits',balance),('Gold',m.account.get('gold')),('Bonds',m.account.get('bonds')),('Current vehicle',current['name'] if current else None),('Current objective',objective),('Comparable battles',prof['n']),('Average standard net',prof.get('standard')),('Average premium estimate',prof.get('premium')),('Average net (strategy)',prof.get('average')),('Average reported operating debit',prof.get('cost')),('Recommended reserve (observed costs)',prof.get('reserve')),('Sample assessment',prof.get('classification'))]])
+    w.set_rows(w.fin_tables['Vehicles'],[(p['name'],p['style']+' · '+p['scope'],p['profile']['n'],fmt(p['profile'].get('standard')),fmt(p['profile'].get('premium')),fmt(p['profile']['recent']),fmt(p['profile']['cost']),fmt(p['profile']['reserve']),fmt(p['profile']['positive']*100)+'%' if p['profile']['positive'] is not None else '—',p['profile']['classification']) for p in sorted(ps,key=lambda p:(p['profile']['n']<5,-(p['profile']['average'] if p['profile']['average'] is not None else -1e20)))])
+    names={p['vehicle']:p['name'] for p in ps}
+    w.set_rows(w.fin_tables['Transactions'],[((time.strftime('%d %b %Y %H:%M',time.localtime(r['at']))+' / ' if r['at'] else '')+str(r['id']),names.get(r['vehicle'],r['vehicle_name'] or r['vehicle']),MODES.get(r['mode'],r['mode']),r['objective'],*[fmt(r[k]) for k in ('original','gross','reward','repair','ammo','consumables','booster','actual')],r['status']) for r in sorted(rows,key=lambda x:x['at'] or 0,reverse=True)[:200]])
+    # Raw account deltas are not battle income; display them separately, never sum into forecasts.
+    try:
+        path=m.root/'history'/'transactions.jsonl'
+        if path.exists() and account:
+            with path.open(encoding='utf-8') as f:
+                from collections import deque
+                recent=deque(f,maxlen=100)
+            for line in reversed(recent):
+                try:
+                    x=json.loads(line)
+                    if x.get('account_key')!=account: continue
+                    table=w.fin_tables['Transactions']; i=table.rowCount(); table.insertRow(i)
+                    for j,val in enumerate([str(x.get('recorded_at','—')),'Account change','—','—','—','—','—','—','—','—','—','—',str(x.get('kind','Unclassified'))+' · '+str(x.get('delta',x.get('changes','Raw journal; not attributed')))]):
+                        table.setItem(i,j,QTableWidgetItem(val))
+                except (ValueError,TypeError): continue
+    except OSError: pass
+    w.fin_forecast_note.setText((t.get('name','Select an optional purchase target')+' · '+('Researched' if t.get('unlocked') else 'Research not confirmed') if t else 'Select an optional purchase target')+' · Purchase price + observed reserve only; crew, configuration and replacement costs not yet fully priced. Ranges are estimates, not guarantees. Premium estimates assume premium remains active; conservative rate includes standard-account earnings.')
+    ff=[]
+    for p in ps:
+        f=forecast(balance,target,p['profile']['reserve'],p['profile'])
+        ff.append((p['name'],*[fmt(f[k]) for k in ('target','shortfall','optimistic','expected','conservative')],p['scope']))
+    w.set_rows(w.fin_tables['Forecast'],ff)
+    w.finance_battle_intent=None
+    w.next_action_request.setVisible(advisor=='On Demand')
+    if advisor=='Information Only':
+        title,detail='Information only','Financial information is available on the Finance page. No automatic advice.'
+    elif advisor=='On Demand' and not getattr(w,'finance_requested',False):
+        title,detail='Advice on demand','Select Show advice when needed.'
+    elif not actionable:
+        title,detail='Waiting for live garage data','No spending or vehicle-switch advice from an unconfirmed account snapshot.'
+    elif objective=='Profit' or grinding:
+        if best:
+            title=('Continue with ' if selected==best['vehicle'] else 'Switch to ')+best['name']
+            detail=reason+' · Combat role: '+best['style']+' · '+best['scope']+' · '+note
+            if best['profile']['n']>=5: detail+=' · '+fmt(best['profile']['average'])+' net credits / battle'
+            if grinding:
+                f=forecast(balance,target,best['profile']['reserve'],best['profile']); detail+=' · Purchase-only forecast: '+fmt(f['expected'])+' battles. Career objective retained.'
+            if selected==best['vehicle']:
+                w.finance_battle_intent=dict(vehicle=selected,style=best['style'],objective=objective,purpose='Credit grinding')
+        else: title,detail='Collect more financial data',reason
+    elif t.get('unlocked') and target is not None and prof.get('reserve') is not None and balance>=target+prof['reserve']:
+        title,detail='Credit target reached','Purchase-only reserve is covered. Progression and configuration suitability still require verification.'
+    else:
+        title,detail='Continue your '+objective+' career track','No confirmed credit bottleneck. Continue normal progression; detailed purchase decisions arrive with the Progression Advisor.'
+    w.next_action_title.setText(title); w.next_action_detail.setText(detail)
+    if objective=='Profit' and hasattr(w,'atlas_style_label'):
+        w.atlas_style_label.setText('Objective: Profit · Combat role: '+(best['style'] if best and selected==best['vehicle'] else 'not confirmed')+' · Tactical recommendations arrive in v0.8.0.')
+def navigate_finance(w,page_name):
+    if page_name in ('Finance','Overview'): refresh_finance(w,True)
+def financial_rows(context,account):
+    # Pure service for future modules; caller must supply confirmed account identity.
+    if not isinstance(account,str) or not re.fullmatch('[0-9a-f]{24}',account): return []
+    rows=context.runtime.invoke_service(context,'battle_performance_projected')
+    return [finance_row(r) for r in rows if r.get('account')==account]
+def financial_profiles(context,account,vehicles,mode,objective,premium=False):
+    return profiles(financial_rows(context,account),vehicles,mode,objective,premium)
+def financial_forecast(context,balance,purchase,reserve,profile,switch_cost=0):
+    return forecast(balance,purchase,reserve,profile,switch_cost)
+def financial_candidate(context,ps,selected,objective,balance=None,goal=None):
+    return choose(ps,selected,objective,balance,goal)
+def register():
+    return {'services':{'financial_rows':financial_rows,'financial_profiles':financial_profiles,'financial_forecast':financial_forecast,'financial_candidate':financial_candidate,'financial_inventory_quote':quote_inventory},'pages':[{'name':'Finance','order':35,'build':make_finance}],'hooks':{'refresh':refresh_finance,'navigate':navigate_finance,'reset':reset_finance}}
