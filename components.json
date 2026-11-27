@@ -18,11 +18,11 @@
       "asset": "WoTQuartermaster.exe",
       "channel": "alpha",
       "min_desktop": "0.2.0",
-      "release": "v0.3.1",
-      "sha256": "576a1f0e97d70d7cba83051e263b78f7638c2afc7e4f5f225afd8fdd30671787",
-      "size": 55731969,
-      "url": "https://github.com/itsr0b0tninja/WoTQuartermaster/releases/download/v0.3.1/WoTQuartermaster.exe",
-      "version": "0.3.1"
+      "release": "v0.3.2",
+      "sha256": "a1968f9b162a45f783854bf0ebc931b8dbe421a90a3ab3bec3a761e9f13ee44a",
+      "size": 55755962,
+      "url": "https://github.com/itsr0b0tninja/WoTQuartermaster/releases/download/v0.3.2/WoTQuartermaster.exe",
+      "version": "0.3.2"
     },
     "replay_parser": {
       "asset": "WoT_Quartermaster_Replay_Parser.txt",
@@ -35,5 +35,73 @@
       "version": "0.0.7"
     }
   },
+  "modules": {
+    "crew": {
+      "api": 1,
+      "asset": "crew.qmodule",
+      "channel": "alpha",
+      "dependencies": {},
+      "min_core": "0.3.1",
+      "release": "crew-v0.1.0",
+      "required": true,
+      "sha256": "66e7aa578c00d45a3065fec60e50f2c4146bfda46352af5eb66757603ff8037c",
+      "size": 4392,
+      "url": "https://github.com/itsr0b0tninja/WoTQuartermaster/releases/download/crew-v0.1.0/crew.qmodule",
+      "version": "0.1.0"
+    },
+    "garage": {
+      "api": 1,
+      "asset": "garage.qmodule",
+      "channel": "alpha",
+      "dependencies": {},
+      "min_core": "0.3.1",
+      "release": "garage-v0.1.0",
+      "required": true,
+      "sha256": "690c25e537b6148db604bafcdcec81432a238709428ca3a254d5eb9f7f97a2df",
+      "size": 8236,
+      "url": "https://github.com/itsr0b0tninja/WoTQuartermaster/releases/download/garage-v0.1.0/garage.qmodule",
+      "version": "0.1.0"
+    },
+    "inventory": {
+      "api": 1,
+      "asset": "inventory.qmodule",
+      "channel": "alpha",
+      "dependencies": {},
+      "min_core": "0.3.1",
+      "release": "inventory-v0.1.0",
+      "required": true,
+      "sha256": "8d453b404e384a8be3efb8c1ea7e3b6a81877fdf8a7f994944ed1f077e8d909f",
+      "size": 10046,
+      "url": "https://github.com/itsr0b0tninja/WoTQuartermaster/releases/download/inventory-v0.1.0/inventory.qmodule",
+      "version": "0.1.0"
+    },
+    "maps": {
+      "api": 1,
+      "asset": "maps.qmodule",
+      "channel": "alpha",
+      "dependencies": {},
+      "min_core": "0.3.1",
+      "release": "maps-v0.1.0",
+      "required": true,
+      "sha256": "df3d389ead5c7fde98d707e4a7a14dbe63e5d7fcfe96b8767d554efdee536dfb",
+      "size": 12856,
+      "url": "https://github.com/itsr0b0tninja/WoTQuartermaster/releases/download/maps-v0.1.0/maps.qmodule",
+      "version": "0.1.0"
+    },
+    "research": {
+      "api": 1,
+      "asset": "research.qmodule",
+      "channel": "alpha",
+      "dependencies": {},
+      "min_core": "0.3.1",
+      "release": "research-v0.1.0",
+      "required": true,
+      "sha256": "f2d7fb5ec07af394d0a7a82c718ed07fabecebb119d5b406aa0934b8a3a6d249",
+      "size": 6643,
+      "url": "https://github.com/itsr0b0tninja/WoTQuartermaster/releases/download/research-v0.1.0/research.qmodule",
+      "version": "0.1.0"
+    }
+  },
+  "retired_modules": [],
   "schema": 1
 }
