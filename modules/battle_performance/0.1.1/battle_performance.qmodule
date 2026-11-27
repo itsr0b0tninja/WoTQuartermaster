@@ -1,0 +1,517 @@
+# WoTQuartermaster Battle Performance 0.1.0 — replay decoding adapted from importer 0.0.7.
+import argparse, hashlib, json, os, re, struct, time
+from pathlib import Path
+text_type=str
+integer_types=(int,)
+def name_text(value):
+    if isinstance(value, bytes) and not isinstance(value, text_type):
+        return value.decode('utf-8', 'replace')
+    return text_type(value)
+
+
+def plain(value, depth=0):
+    if depth > 20:
+        raise ValueError('Data nesting limit')
+    if value is None or isinstance(value, (bool, float) + integer_types):
+        return value
+    if isinstance(value, (text_type, bytes)):
+        return name_text(value)
+    if hasattr(value, '_asdict'):
+        return plain(value._asdict(), depth+1)
+    if isinstance(value, dict):
+        return {name_text(k): plain(v, depth+1) for k, v in value.items()}
+    if isinstance(value, (tuple, list, set, frozenset)):
+        seq = sorted(value, key=lambda x: name_text(x)) if isinstance(value, (set, frozenset)) else value
+        return [plain(v, depth+1) for v in seq]
+    raise TypeError('Unsupported value: ' + type(value).__name__)
+
+
+# Explicitly selected personal result fields; no opponent identities or chat.
+BATTLE_FIELDS = set(('credits originalCredits factualCredits subtotalCredits eventCredits eventCreditsList premiumCredits creditsToDraw creditsPenalty creditsContribution creditsContributionIn creditsContributionOut creditsReplay originalPremSquadCredits premiumCreditsFactor100 premiumPlusCreditsFactor100 appliedPremiumCreditsFactor100 wotPlusProBoostCreditsFactor100 orderCreditsFactor100 xp originalXP factualXP subtotalXP premiumXP eventXP eventXPList dailyXPFactor10 premiumXPFactor100 premiumPlusXPFactor100 appliedPremiumXPFactor100 additionalXPFactor10 orderXPFactor100 freeXP originalFreeXP factualFreeXP subtotalFreeXP premiumFreeXP eventFreeXP eventFreeXPList orderFreeXPFactor100 tmenXP originalTmenXP originalTMenXP factualTMenXP subtotalTMenXP premiumTmenXPFactor100 appliedPremiumTmenXPFactor100 xpByTmen damageDealt damageReceived damageBlockedByArmor damageAssistedRadio damageAssistedTrack damageAssistedStun kills shots directHits directEnemyHits piercings piercingEnemyHits spotted deathReason deathCount mileage lifeTime team typeCompDescr repair autoRepairCost autoLoadCost autoEquipCost autoEquipBoostersCost autoRepair autoLoad autoEquip capturePoints droppedCapturePoints arenaTypeID duration winnerTeam bonusType gameplayType guiType finishReason arenaCreateTime').split())
+
+def result_projection(raw):
+    if not isinstance(raw,dict):
+        raise ValueError('Expected battle results mapping')
+    def project(d):
+        out = {}
+        if not isinstance(d,dict):
+            return out
+        for k,v in d.items():
+            if k in BATTLE_FIELDS:
+                try: out[k]=plain(v)
+                except Exception: pass
+        return out
+    personal=raw.get('personal',{})
+    rows={}
+    if isinstance(personal,dict):
+        for k,v in personal.items():
+            key=name_text(k)
+            if key.isdigit() or key=='avatar':
+                value=project(v)
+                if value: rows[key]=value
+        if not rows and project(personal): rows['unidentified']=project(personal)
+    common=raw.get('common',{})
+    return {'common':project(common),'personal':rows,'bots_present': bool(common['bots']) if isinstance(common,dict) and 'bots' in common else None}
+
+def account_hash(dbid):
+    import hashlib
+    if dbid is None or not name_text(dbid).isdigit() or int(dbid)<=0: return None
+    return hashlib.sha256(('wot-local:'+name_text(dbid)).encode('utf-8')).hexdigest()[:24]
+
+def battle_id_text(value):
+    if value is None or not name_text(value).isdigit() or int(value)<=0: return None
+    return name_text(value)
+
+def battle_mode(data):
+    # Conservative: a mixed/bot match must never be included in pure PvP.
+    code=data.get('common',{}).get('bonusType')
+    if code==46 or data.get('bots_present') is True: return 'ai_or_mixed'
+    if code==1 and data.get('bots_present') is not True: return 'random_pvp'
+    if code in (0, None): return 'unknown'
+    return 'other_mode'
+MAGIC=b'\x12\x32\x34\x11'
+MAX_BLOCK=64*1024*1024
+VERSION='0.0.7'
+
+def parse_replay(path):
+    with path.open('rb') as f:
+        if f.read(4)!=MAGIC: raise ValueError('Unrecognised replay signature')
+        def uint():
+            b=f.read(4)
+            if len(b)!=4: raise ValueError('Truncated replay header')
+            return struct.unpack('<I',b)[0]
+        count=uint()
+        if count not in (1,2): raise ValueError('Unsupported replay block count: %d'%count)
+        def block():
+            size=uint()
+            if size>MAX_BLOCK: raise ValueError('Replay JSON block too large')
+            raw=f.read(size)
+            if len(raw)!=size: raise ValueError('Truncated replay JSON')
+            return json.loads(raw)
+        meta=block()
+        if not isinstance(meta,dict): raise ValueError('Unexpected replay metadata')
+        if count==1: raise ValueError('Replay has no completed results block')
+        results=block()
+        if isinstance(results,list) and results: results=results[0]
+        if not isinstance(results,dict): raise ValueError('Unexpected results format')
+    arena=battle_id_text(results.get('arenaUniqueID'))
+    account=account_hash(meta.get('playerID'))
+    data=result_projection(results)
+    if not arena or not account or not data['personal']: raise ValueError('Missing battle/account identity or personal results')
+    return {'battle_id':arena,'account_key':account,'source':'replay','data':data,'mode':battle_mode(data),'metadata':{k:meta[k] for k in ('playerVehicle','mapName','mapDisplayName','dateTime','clientVersionFromXml','clientVersionFromExe','battleType','gameplayID','regionCode') if k in meta}}
+
+def atomic_json(path,obj):
+    path.parent.mkdir(parents=True,exist_ok=True)
+    tmp=path.with_suffix(path.suffix+'.tmp')
+    with tmp.open('w',encoding='utf-8') as f:
+        json.dump(obj,f,ensure_ascii=True,allow_nan=False,sort_keys=True,indent=2)
+        f.flush(); os.fsync(f.fileno())
+    os.replace(tmp,path)
+
+def read_json(path,default):
+    if not path.exists(): return default
+    with path.open(encoding='utf-8') as f: return json.load(f)
+
+def journal(path,issues):
+    if not path.exists(): return
+    with path.open('rb') as f:
+        for i,line in enumerate(f,1):
+            try:
+                r=json.loads(line)
+                if isinstance(r,dict): yield r
+                else: raise ValueError('Not an object')
+            except (ValueError,UnicodeError): issues.append('%s line %d: invalid JSON; skipped'%(path.name,i))
+
+def fingerprint(data):
+    return hashlib.sha256(json.dumps(data,ensure_ascii=True,sort_keys=True,allow_nan=False).encode('ascii')).hexdigest()
+
+def identity(r):
+    account=r.get('account_key'); arena=battle_id_text(r.get('battle_id'))
+    if not arena or not isinstance(account,str) or not re.fullmatch('[0-9a-f]{24}',account): return None
+    return account+':'+arena
+
+
+import logging, threading, queue, math, datetime
+from module_shared import obj, seq, name
+from module_runtime import atomic_bytes
+MODULE={'id':'battle_performance','version':'0.1.1','api':1,'min_core':'0.4.1','dependencies':{}}
+STYLES={
+ 'Passive Scout':{'radio':45,'damage':10,'track':10,'life_fraction':25,'spotted':10},
+ 'Active Scout':{'radio':40,'damage':15,'track':10,'life_fraction':20,'spotted':15},
+ 'Hybrid Scout':{'radio':30,'damage':30,'track':10,'life_fraction':20,'spotted':10},
+ 'Combat Scout':{'radio':25,'damage':40,'track':10,'life_fraction':15,'spotted':10},
+ 'Flanker':{'radio':10,'damage':50,'track':10,'life_fraction':15,'kills':15},
+ 'Fire Support':{'radio':5,'damage':50,'track':20,'life_fraction':15,'accuracy':10},
+ 'Concealed Sniper':{'radio':5,'damage':50,'track':5,'life_fraction':20,'accuracy':20},
+ 'Brawler':{'damage':40,'track':10,'life_fraction':15,'blocked':20,'trade':15},
+ 'Defensive Fighter':{'radio':5,'damage':30,'track':15,'life_fraction':20,'blocked':20,'defence':10},
+ 'Artillery Support':{'damage':35,'track':15,'life_fraction':10,'stun':40}}
+LABELS={'damage':'Damage','radio':'Spotting assist','track':'Tracking assist','stun':'Stun assist','combined':'Damage + summed assist (estimate)','assistance':'Summed assistance (estimate)','life':'Survival seconds','life_fraction':'Share of battle survived','spotted':'Enemies spotted','kills':'Kills','blocked':'Damage blocked','received':'Damage received','defence':'Defence points','accuracy':'Hit rate','penetration':'Penetration rate','trade':'Damage ratio','win':'Win rate','survived':'Survival rate','base_xp':'Original XP'}
+MODES={'random_pvp':'Random PvP','ai_or_mixed':'AI / mixed','other_mode':'Other mode','unknown':'Unknown'}
+def numeric(x):
+    return x if isinstance(x,(int,float)) and not isinstance(x,bool) and math.isfinite(x) and x>=0 else None
+def divide(a,b):
+    return a/b if a is not None and b is not None and b>0 else None
+def add_known(*v):
+    return sum(v) if all(x is not None for x in v) else None
+def style_name(x):
+    return next((s for s in STYLES if s.casefold()==str(x).casefold()),'Fire Support' if str(x).casefold()=='support' else None)
+def safe_read(path,default):
+    try: return read_json(path,default)
+    except (OSError,ValueError,TypeError): return default
+def atomic_record(path,data):
+    path.parent.mkdir(parents=True,exist_ok=True)
+    atomic_bytes(path,json.dumps(data,ensure_ascii=True,sort_keys=True,allow_nan=False,indent=2).encode('utf-8'))
+def config_info(candidate):
+    wrapper=obj(candidate.get('configuration'))
+    cfg=obj(wrapper.get('configuration'))
+    if candidate.get('configuration_status')!='queue_vehicle_matched' or not cfg or str(cfg.get('intCD'))!=str(candidate.get('avatar_vehicle_id')): return None
+    # Compare actual loadouts, not XP, ammunition quantity or temporary crew skill progress.
+    modules={k:obj(v).get('intCD') for k,v in obj(cfg.get('modules')).items()}
+    equip=[obj(v).get('intCD') for v in seq(cfg.get('optDevices'))]
+    crew=[]
+    for _,c in sorted(obj(cfg.get('crew')).items()):
+        skills=sorted(str(obj(x).get('name') or obj(x).get('skill') or '') for x in seq(obj(c).get('skills')))
+        bonus={role:[obj(v).get('name') or obj(v).get('skill') for v in seq(values)] for role,values in obj(obj(c).get('bonus_skills')).items()}
+        crew.append({'role':obj(c).get('role'),'skills':skills,'bonus':bonus})
+    profile={'modules':modules,'equipment':equip,'crew':crew,'consumables':[obj(v).get('intCD') for v in seq(cfg.get('consumables'))],'boosters':[obj(v).get('intCD') for v in seq(cfg.get('battleBoosters'))]}
+    title=(obj(obj(cfg.get('modules')).get('gun')).get('userName') or 'Unknown gun')+' / '+', '.join(obj(v).get('userName') or 'Empty' for v in seq(cfg.get('optDevices')))
+    return {'id':fingerprint(profile)[:12],'label':title,'profile':profile}
+def reconcile_all(replays,history,observed,issues):
+    battles={}
+    def entry(k,r):
+        return battles.setdefault(k,{'account_key':r['account_key'],'battle_id':str(r['battle_id']),'sources':{},'configuration_candidates':[],'observed':{}})
+    def add(r,source):
+        k=identity(r)
+        if not k or not isinstance(r.get('data'),dict): return
+        e=entry(k,r); record={'data':r['data'],'metadata':obj(r.get('metadata')),'mode':r.get('mode') or battle_mode(r['data']),'recorded_at':r.get('recorded_at')}
+        a=e['sources'].setdefault(source,[])
+        if not any(x['data']==record['data'] and x['metadata']==record['metadata'] for x in a): a.append(record)
+    for r in replays.values(): add(r,'replay')
+    for r in journal(history/'battle_results.jsonl',issues): add(r,'connector')
+    for r in journal(history/'configurations.jsonl',issues):
+        k=identity(r)
+        if k and r.get('kind')=='battle_start_candidate':
+            e=entry(k,r); item={key:r.get(key) for key in ('configuration','configuration_status','avatar_vehicle_id','recorded_at')}
+            if item not in e['configuration_candidates']: e['configuration_candidates'].append(item)
+    for k,r in observed.items():
+        if identity(r)==k: entry(k,r)['observed']=r
+    for e in battles.values():
+        merged={'common':{},'personal':{},'bots_present':None}; conflicts=set(); meta={}; modes=[]
+        for source in ('replay','connector'):
+            for r in e['sources'].get(source,[]):
+                d=r['data']; modes.append(r.get('mode'))
+                meta.update({k:v for k,v in r['metadata'].items() if v is not None})
+                for key,v in obj(d.get('common')).items():
+                    if v is None: continue
+                    if key in merged['common'] and merged['common'][key]!=v: conflicts.add('common.'+key)
+                    merged['common'][key]=v
+                for vid,stats in obj(d.get('personal')).items():
+                    dest=merged['personal'].setdefault(str(vid),{})
+                    for key,v in obj(stats).items():
+                        if v is None: continue
+                        if key in dest and dest[key]!=v: conflicts.add('personal.'+str(vid)+'.'+key)
+                        dest[key]=v
+                if d.get('bots_present') is True: merged['bots_present']=True
+                elif d.get('bots_present') is False and merged['bots_present'] is None: merged['bots_present']=False
+        e['data']=merged; e['metadata']=meta; e['conflicts']=sorted(conflicts)
+        e['mode']='ai_or_mixed' if 'ai_or_mixed' in modes else battle_mode(merged)
+        if e['mode']=='unknown' and not e['sources']:
+            bonus=e['observed'].get('bonus_type')
+            e['mode']='ai_or_mixed' if bonus==46 else 'unknown'
+        e['status']='source_conflict' if conflicts else 'linked' if len(e['sources'])==2 else 'single_source' if e['sources'] else 'awaiting_result'
+    return battles
+def scan_performance(root,replay_dir,observed):
+    history=root/'history'; folder=root/'performance'; folder.mkdir(parents=True,exist_ok=True)
+    # Independent derived cache; never edit Connector journals or replay files.
+    replay_path=folder/'replays.json'; index_path=folder/'replay_index.json'
+    replays=obj(obj(safe_read(replay_path,{})).get('records')); index=obj(obj(safe_read(index_path,{})).get('files'))
+    if not replays:
+        replays.update(obj(obj(safe_read(history/'replay_results.json',{})).get('records')))
+    issues=[]; imported=0; skipped=0; pending=0; changed=False
+    if replay_dir.is_dir():
+        for path in sorted(replay_dir.rglob('*.wotreplay')):
+            try:
+                stat=path.stat(); key=str(path.resolve()); stamp=[stat.st_size,stat.st_mtime_ns]; old=index.get(key,{})
+                if old.get('stamp')==stamp and old.get('status')=='ok' and old.get('battle_key') in replays: skipped+=1; continue
+                # A replay without results can become complete later, even after returning to garage.
+                result=parse_replay(path)
+                after=path.stat()
+                if [after.st_size,after.st_mtime_ns]!=stamp: raise ValueError('Replay still being written')
+                bid=identity(result)
+                if bid not in replays: imported+=1; replays[bid]=result
+                elif replays[bid]['data']!=result['data']: issues.append('Conflicting replay copy: '+path.name); continue
+                index[key]={'stamp':stamp,'status':'ok','battle_key':bid}; changed=True
+            except (OSError,ValueError,KeyError,TypeError,struct.error) as exc:
+                pending+=1; issues.append(path.name+': '+str(exc))
+    else: issues.append('Replay directory not found: '+str(replay_dir))
+    if changed:
+        atomic_record(replay_path,{'schema':1,'records':replays}); atomic_record(index_path,{'schema':1,'files':index})
+    battles=reconcile_all(replays,history,observed,issues)
+    report={'new_replays':imported,'unchanged_files':skipped,'incomplete_or_unsupported':pending,'unique_combined_battles':len(battles),'issues':issues[-100:]}
+    atomic_record(folder/'unified_battles.json',{'schema':1,'records':battles,'generated_at':time.time()})
+    atomic_record(folder/'import_status.json',report)
+    return battles,report
+def project(e):
+    data=e['data']; common=obj(data.get('common')); personal=obj(data.get('personal')); observed=obj(e.get('observed'))
+    candidates=e.get('configuration_candidates',[])
+    vids={str(x.get('avatar_vehicle_id')) for x in candidates if x.get('avatar_vehicle_id') is not None}
+    if observed.get('vehicle_id') is not None: vids.add(str(observed['vehicle_id']))
+    rows=[(str(k),v) for k,v in personal.items() if isinstance(v,dict) and (str(k).isdigit() or k=='unidentified') and ('typeCompDescr' in v or 'damageDealt' in v or 'shots' in v)]
+    # Never sum across multi-vehicle modes or duplicate avatar rows.
+    match=[(k,v) for k,v in rows if k in vids or str(v.get('typeCompDescr')) in vids]
+    chosen=match[0] if len(match)==1 else rows[0] if not match and len(rows)==1 else (None,{})
+    k,p=chosen; vid=p.get('typeCompDescr') or (k if k and k.isdigit() else None) or (next(iter(vids)) if len(vids)==1 else None)
+    v=lambda name:numeric(p.get(name))
+    c=lambda name:numeric(common.get(name))
+    team=v('team'); winner=c('winnerTeam'); death=v('deathCount')
+    outcome='Victory' if team in (1,2) and winner==team else 'Draw' if team in (1,2) and winner==0 else 'Defeat' if team in (1,2) and winner in (1,2) else 'Unknown'
+    life=v('lifeTime'); duration=c('duration'); radio=v('damageAssistedRadio'); track=v('damageAssistedTrack'); stun=v('damageAssistedStun')
+    assist=add_known(radio,track,stun); damage=v('damageDealt')
+    stats={'damage':damage,'radio':radio,'track':track,'stun':stun,'assistance':assist,'combined':add_known(damage,assist),'life':life,'life_fraction':min(1,divide(life,duration)) if divide(life,duration) is not None else None,'spotted':v('spotted'),'kills':v('kills'),'blocked':v('damageBlockedByArmor'),'received':v('damageReceived'),'defence':v('droppedCapturePoints'),'shots':v('shots'),'hits':v('directHits'),'piercings':v('piercings'),'accuracy':divide(v('directHits'),v('shots')),'penetration':divide(v('piercings'),v('directHits')),'trade':divide(damage,v('damageReceived')),'win':float(outcome=='Victory') if outcome!='Unknown' else None,'survived':float(death==0) if death is not None else None,'base_xp':v('originalXP')}
+    # A disputed field remains in the details but cannot contaminate an aggregate.
+    conflict=bool(e.get('conflicts'))
+    confs=[config_info(x) for x in candidates]; confs=[x for x in confs if x]
+    config=confs[0] if confs and all(x['id']==confs[0]['id'] for x in confs) else None
+    at=c('arenaCreateTime') or numeric(observed.get('recorded_at'))
+    if at is None:
+        times=[numeric(x.get('recorded_at')) for x in candidates]; times=[x for x in times if x is not None]
+        at=min(times) if times else None
+    if at is None:
+        for fmt in ('%d.%m.%Y %H:%M:%S','%Y-%m-%d %H:%M:%S'):
+            try: at=datetime.datetime.strptime(str(e['metadata'].get('dateTime')),fmt).timestamp(); break
+            except (ValueError,OverflowError): pass
+    return {'id':e['battle_id'],'account':e['account_key'],'vehicle':str(vid) if vid is not None else '', 'vehicle_name':e['metadata'].get('playerVehicle'),'map':str(common.get('arenaTypeID') or observed.get('map_id') or e['metadata'].get('mapName') or ''),'map_name':observed.get('map_name') or e['metadata'].get('mapDisplayName'),'team':team or observed.get('team'),'style':style_name(observed.get('style')) or 'Unclassified','mode':e['mode'],'at':at,'outcome':outcome,'stats':stats,'config':config,'status':e['status'],'sources':'+'.join(e['sources']) or 'start only','eligible':bool(p and e['sources'] and not conflict),'raw':e,'personal':p}
+def mean(rows,k):
+    values=[r['stats'].get(k) for r in rows if r['eligible'] and r['stats'].get(k) is not None]
+    return (sum(values)/len(values),len(values)) if values else (None,0)
+def ratio_total(rows,a,b):
+    pairs=[(r['stats'][a],r['stats'][b]) for r in rows if r['eligible'] and r['stats'].get(a) is not None and r['stats'].get(b) is not None]
+    return (divide(sum(x for x,y in pairs),sum(y for x,y in pairs)),len(pairs)) if pairs else (None,0)
+def aggregate(rows,k):
+    return ratio_total(rows,*{'accuracy':('hits','shots'),'penetration':('piercings','hits'),'trade':('damage','received')}[k]) if k in ('accuracy','penetration','trade') else mean(rows,k)
+def sample_label(n):
+    return 'No data' if n==0 else 'Insufficient data' if n<5 else 'Preliminary' if n<10 else 'Early assessment' if n<20 else 'Established personal baseline' if n<50 else 'More reliable history' if n<100 else 'Extended history'
+def assessment(rows,style):
+    # Same account, vehicle, mode, intended style only. Compare independent 20-battle windows.
+    valid=sorted([r for r in rows if r['eligible'] and r['at'] is not None],key=lambda r:r['at'])
+    n=len(valid); result=[]
+    if n<40 or style not in STYLES: return n,result,None
+    prior,recent=valid[-40:-20],valid[-20:]; score=0; weight=0
+    for k,w in STYLES[style].items():
+        old,no=aggregate(prior,k); new,nn=aggregate(recent,k)
+        index=100*new/old if no>=15 and nn>=15 and old is not None and old>0 and new is not None else None
+        result.append((k,w,old,new,no,nn,index))
+        if index is not None: score+=w*min(200,index); weight+=w
+    return n,result,score/weight if weight>=75 else None
+def fmt(x,k=''):
+    if x is None: return '—'
+    if k in ('win','survived','accuracy','penetration','life_fraction'): return f'{x*100:.1f}%'
+    if k=='life': return f'{int(x)//60}:{int(x)%60:02d}'
+    if isinstance(x,int): return f'{x:,}'
+    return f'{x:,.2f}' if k in ('kills','spotted','trade') else f'{x:,.1f}'
+def label_time(at):
+    try: return datetime.datetime.fromtimestamp(at).strftime('%d %b %Y %H:%M')
+    except (ValueError,TypeError,OverflowError,OSError): return 'Unknown date'
+
+def make_history(w):
+    p,l=page(); heading(l,'Battle Performance','Battle history, per-battle statistics and personal playstyle comparisons · module '+MODULE['version'])
+    w.nav['History'].setText('Performance')
+    w.bp_note=label('Waiting for local history', 'Subheading',True); l.addWidget(w.bp_note)
+    controls=QGridLayout(); l.addLayout(controls)
+    w.bp_vehicle=QComboBox(); w.bp_mode=QComboBox(); w.bp_style=QComboBox(); w.bp_period=QComboBox(); w.bp_account=QComboBox()
+    for i,(title,widget) in enumerate([('Account',w.bp_account),('Vehicle',w.bp_vehicle),('Battle type',w.bp_mode),('Recorded playstyle',w.bp_style),('Period',w.bp_period)]):
+        controls.addWidget(label(title),0,i); controls.addWidget(widget,1,i); widget.currentIndexChanged.connect(lambda _=0: render_bp(w))
+    for k,v in MODES.items(): w.bp_mode.addItem(v,k)
+    w.bp_mode.addItem('All battle types (browse only)','all')
+    w.bp_style.addItem('All playstyles','all')
+    for s in STYLES: w.bp_style.addItem(s,s)
+    w.bp_style.addItem('Unclassified','Unclassified')
+    for v in (50,20,100,0): w.bp_period.addItem('All battles' if not v else 'Last '+str(v)+' battles',v)
+    w.bp_tabs=QTabWidget(); l.addWidget(w.bp_tabs,1); w.bp_tables={}
+    for title,headers in [('Overview',['Statistic','Value','Reporting battles']),('Battles',['Date','Vehicle','Map','Mode','Playstyle','Result','Damage','Assist (sum)','Status','Battle ID']),('Vehicles',['Vehicle / mode / playstyle','Battles','Results','Avg damage','Avg assist','Win rate','Survival']),('Playstyles',['Playstyle / battle type','Battles','Results','Avg damage','Avg assist','Win rate','Survival']),('Trends',['Period / group','Battles','Avg damage','Avg assist','Win rate','Survival']),('Assessment',['Metric','Weight','Prior 20','Recent 20','Coverage','Relative index'])]:
+        panel_widget,pl=page(); t=w.data_table(headers); w.bp_tables[title]=t
+        if title=='Battles':
+            w.bp_detail=label('Select a battle for full details.',wrap=True); t.currentCellChanged.connect(lambda *_: detail_bp(w)); pl.addWidget(t,1)
+            scroll=QScrollArea(); scroll.setWidgetResizable(True); scroll.setWidget(w.bp_detail); scroll.setMinimumHeight(155); pl.addWidget(scroll)
+        elif title=='Assessment':
+            w.bp_assess_note=label('',wrap=True); pl.addWidget(w.bp_assess_note); pl.addWidget(t,1)
+            w.bp_advice=QPushButton('Show assessment'); w.bp_advice.clicked.connect(lambda:render_bp(w,True)); pl.addWidget(w.bp_advice)
+        else: pl.addWidget(t,1)
+        w.bp_tabs.addTab(panel_widget,title)
+    scan=QPushButton('Import replays / refresh history'); scan.clicked.connect(lambda:refresh_bp(w,True,request=True)); l.addWidget(scan)
+    l.addWidget(label('Historical filters only. Change the active playstyle in Overview or Settings.', 'Subheading',True))
+    w.bp_rows=[]; w.bp_records={}; w.bp_queue=queue.Queue(); w.bp_thread=None; w.bp_next=0; w.bp_root=None; w.bp_observed={}; w.bp_last_vehicle=None; w.bp_last_state=None; w.bp_entry_style=None; w.bp_last_key=None; w.bp_visible=[]; w.bp_report={}; w.bp_generation=0; w.bp_filter_stamp=None; w.bp_requested_assessment=None
+    w.add_page('History',p)
+def reset_bp(w):
+    if hasattr(w,'bp_generation'):
+        w.bp_generation+=1; w.bp_root=None; w.bp_next=0; w.bp_filter_stamp=None; w.bp_rows=[]; w.bp_records={}
+def pick(cb,value):
+    i=cb.findData(value); cb.setCurrentIndex(max(0,i))
+def set_choices(cb,choices,default=None):
+    cur=cb.currentData(); cb.blockSignals(True); cb.clear()
+    for title,k in choices: cb.addItem(str(title),k)
+    pick(cb,cur if any(k==cur for _,k in choices) else default); cb.blockSignals(False)
+def vehicle_title(w,r):
+    v=obj(w.model.garage_data.catalogue.item('vehicles',r['vehicle'])) if w.model and r['vehicle'] else {}
+    return v.get('userName') or r.get('vehicle_name') or ('Vehicle '+r['vehicle'] if r['vehicle'] else 'Unknown vehicle')
+def map_title(w,r):
+    if r.get('map_name'): return r['map_name']
+    v=obj(w.model.garage_data.catalogue.item('maps',r['map'])) if w.model and r['map'] else {}
+    return v.get('userName') or v.get('name') or r['map'] or 'Unknown map'
+def effective_style(w):
+    return style_name(w.settings.values.get('playstyle')) or 'Unclassified'
+def current_account(w):
+    if not w.model: return None
+    ctx=obj(w.model.sources.get('battle_context')); a=ctx.get('account_key')
+    if isinstance(a,str) and re.fullmatch('[0-9a-f]{24}',a): return a
+    # Fall back to latest account event only when identity was explicitly recorded.
+    return w.bp_latest_account
+def refresh_bp(w,force=False,request=False):
+    if not hasattr(w,'bp_queue') or not w.model: return
+    m=w.model; root=m.root
+    if w.bp_root!=root:
+        w.bp_root=root; w.bp_generation+=1; w.bp_entry_style=None; w.bp_last_state=None
+        w.bp_observed=obj(obj(safe_read(root/'performance'/'observed.json',{})).get('records')); w.bp_records=obj(obj(safe_read(root/'performance'/'unified_battles.json',{})).get('records'))
+        w.bp_rows=[project(e) for e in w.bp_records.values()]; w.bp_report={}; w.bp_next=0; w.bp_last_key=None; w.bp_latest_account=None
+        w.bp_filter_stamp=None
+    ctx=obj(m.context)
+    # Snapshot the intended career track at queue entry/loading. An app opened mid-battle does not guess historical intent.
+    if m.state in ('matchmaking','battle_loading') and w.bp_last_state not in ACTIVE_BATTLE|{'matchmaking'}:
+        w.bp_entry_style=effective_style(w)
+    elif m.state=='battle_loading' and w.bp_entry_style is None:
+        w.bp_entry_style=effective_style(w)
+    elif m.state not in ACTIVE_BATTLE|{'matchmaking'}:
+        w.bp_entry_style=None
+    if m.state in ACTIVE_BATTLE and ctx and ctx.get('vehicle_id') is not None:
+        r={k:ctx.get(k) for k in ('account_key','battle_id','vehicle_id','map_id','map_name','team','bonus_type')}
+        bid=identity(r)
+        if bid and bid not in w.bp_observed:
+            r['style']=w.bp_entry_style or 'Unclassified'; r['recorded_at']=time.time(); r['observed_state']=m.state
+            w.bp_observed[bid]=r; atomic_record(root/'performance'/'observed.json',{'schema':1,'records':w.bp_observed})
+            w.bp_next=0
+    while True:
+        try: gen,rows,report,error,latest=w.bp_queue.get_nowait()
+        except queue.Empty: break
+        if gen!=w.bp_generation: continue
+        if error: w.bp_note.setText('Import unavailable: '+error+' · Previous records retained'); continue
+        w.bp_records=rows; w.bp_rows=[project(e) for e in rows.values()]; w.bp_report=report; w.bp_latest_account=latest; w.bp_filter_stamp=None
+    if w.bp_last_state in ACTIVE_BATTLE and m.state not in ACTIVE_BATTLE: w.bp_next=0
+    w.bp_last_state=m.state
+    if request: w.bp_next=0
+    if m.state not in ACTIVE_BATTLE|{'matchmaking'} and time.monotonic()>=w.bp_next and (w.bp_thread is None or not w.bp_thread.is_alive()):
+        w.bp_next=time.monotonic()+30; gen=w.bp_generation; observed=dict(w.bp_observed)
+        game=Path(w.settings.values['game_path']).expanduser(); game=game if game.is_absolute() else w.settings.base/game
+        q=w.bp_queue
+        def worker():
+            try:
+                rows,report=scan_performance(root,game/'replays',observed)
+                latest=None
+                for r in journal(root/'history'/'account_events.jsonl',[]):
+                    a=r.get('account_key')
+                    if isinstance(a,str) and re.fullmatch('[0-9a-f]{24}',a): latest=a
+                q.put((gen,rows,report,None,latest))
+            except Exception as exc:
+                logging.exception('Battle history import failed'); q.put((gen,None,None,str(exc),None))
+        w.bp_thread=threading.Thread(target=worker,daemon=True); w.bp_thread.start()
+    if w.stack.currentWidget()==w.pages.get('History'):
+        stamp=(w.bp_generation,id(w.bp_records),current_account(w),m.garage_signature,w.settings.values.get('advisor_mode'))
+        if stamp!=w.bp_filter_stamp:
+            w.bp_filter_stamp=stamp
+            accounts=sorted({r['account'] for r in w.bp_rows}); active=current_account(w)
+            if active and active not in accounts: accounts.append(active)
+            choices=[('Current account','current')]+[(('Current · ' if a==active else 'Account · ')+a[:8],a) for a in accounts]
+            set_choices(w.bp_account,choices,'current')
+            vs={r['vehicle']:vehicle_title(w,r) for r in w.bp_rows if r['vehicle']}
+            for v in m.garage: vs[str(v.get('intCD'))]=v.get('userName') or str(v.get('intCD'))
+            set_choices(w.bp_vehicle,[('All vehicles','all')]+sorted([(n,k) for k,n in vs.items()]),'all')
+            render_bp(w)
+def display_group(rows,title):
+    return (title,len(rows),sum(r['eligible'] for r in rows),fmt(mean(rows,'damage')[0]),fmt(mean(rows,'assistance')[0]),fmt(mean(rows,'win')[0],'win'),fmt(mean(rows,'survived')[0],'survived'))
+def render_bp(w,explicit=False):
+    if not hasattr(w,'bp_rows') or not w.model: return
+    account=w.bp_account.currentData()
+    if account=='current': account=current_account(w)
+    if not account:
+        accounts={r['account'] for r in w.bp_rows}; account=next(iter(accounts)) if len(accounts)==1 else None
+    vehicle=w.bp_vehicle.currentData(); mode=w.bp_mode.currentData(); style=w.bp_style.currentData(); period=w.bp_period.currentData()
+    rows=[r for r in w.bp_rows if r['account']==account and (vehicle in (None,'all') or r['vehicle']==vehicle) and (mode in (None,'all') or r['mode']==mode) and (style in (None,'all') or r['style']==style)]
+    rows.sort(key=lambda r:(r['at'] or 0,r['id']),reverse=True)
+    full=rows
+    if period: rows=rows[:period]
+    w.bp_visible=rows; complete=sum(r['eligible'] for r in rows); pending=sum(r['status']=='awaiting_result' for r in rows); conflicts=sum(r['status']=='source_conflict' for r in rows)
+    report=w.bp_report; w.bp_note.setText(f'{len(rows)} matching battles · {complete} usable results · {pending} awaiting result · {conflicts} conflicts excluded · {sample_label(complete)}'+(' · Replay files incomplete/unsupported: '+str(report['incomplete_or_unsupported']) if 'incomplete_or_unsupported' in report else ''))
+    metrics=[]
+    for k in ('win','survived','damage','radio','track','stun','assistance','combined','kills','spotted','blocked','life','accuracy','penetration','trade','base_xp'):
+        v,n=aggregate(rows,k) if mode!='all' else (None,0); metrics.append((LABELS[k],fmt(v,k),str(n)+' / '+str(complete) if mode!='all' else 'Choose a battle type'))
+    w.set_rows(w.bp_tables['Overview'],metrics)
+    w.set_rows(w.bp_tables['Battles'],[(label_time(r['at']),vehicle_title(w,r),map_title(w,r),MODES[r['mode']],r['style'],r['outcome'],fmt(r['stats']['damage']),fmt(r['stats']['assistance']),r['status'].replace('_',' '),r['id']) for r in rows])
+    groups={}
+    for r in rows: groups.setdefault((vehicle_title(w,r),MODES[r['mode']],r['style']),[]).append(r)
+    w.set_rows(w.bp_tables['Vehicles'],[display_group(g,' / '.join(k)) for k,g in sorted(groups.items())])
+    # Comparison deliberately ignores the recorded-playstyle filter, but respects account, vehicle, period and mode.
+    compare=[r for r in w.bp_rows if r['account']==account and (vehicle in (None,'all') or r['vehicle']==vehicle) and (mode in (None,'all') or r['mode']==mode)]
+    compare.sort(key=lambda r:(r['at'] or 0,r['id']),reverse=True)
+    if period: compare=compare[:period]
+    play_rows=[]
+    for mode_key in (MODES if mode=='all' else [mode or 'random_pvp']):
+        for s in list(STYLES)+['Unclassified']:
+            g=[r for r in compare if r['style']==s and r['mode']==mode_key]
+            play_rows.append(display_group(g,s+' / '+MODES[mode_key]))
+    w.set_rows(w.bp_tables['Playstyles'],play_rows)
+    trend=[]; valid=[r for r in reversed(rows) if r['at'] is not None and r['eligible']]
+    if mode=='all': valid=[]
+    for i in range(0,len(valid),10):
+        g=valid[i:i+10]; trend.append(display_group(g,'Battles '+str(i+1)+'–'+str(i+len(g)))[0:2]+display_group(g,'')[3:])
+    groups={}
+    for r in rows:
+        groups.setdefault(('Map: '+map_title(w,r)+' / team '+str(r['team'] or '?')+' / '+vehicle_title(w,r)+' / '+MODES[r['mode']]+' / '+r['style']),[]).append(r)
+        if r['config']: groups.setdefault(('Loadout: '+r['config']['label']+' ['+r['config']['id']+'] / '+vehicle_title(w,r)+' / '+MODES[r['mode']]+' / '+r['style']),[]).append(r)
+    for title,g in sorted(groups.items()):
+        line=display_group(g,title); trend.append(line[:2]+line[3:])
+    w.set_rows(w.bp_tables['Trends'],trend)
+    modepref=w.settings.values.get('advisor_mode','Full Advisor'); w.bp_advice.setEnabled(modepref!='Information Only')
+    selection=(account,vehicle,mode,style)
+    if explicit: w.bp_requested_assessment=selection
+    if modepref!='On Demand': w.bp_requested_assessment=None
+    comparable=vehicle not in ('all',None) and mode in ('random_pvp','ai_or_mixed') and style in STYLES
+    if not comparable:
+        note='Select one vehicle, Random PvP or AI/mixed, and one recorded playstyle for an assessment. Never combine roles or game modes.'; result=[]; score=None
+    else:
+        n,result,score=assessment(full,style); note=f'{sample_label(n)} · {n} comparable completed battles. Comparison requires 40 dated results (previous 20 vs recent 20).'
+        if result: note+=' · Relative personal baseline, not an external rating.'
+    if modepref=='Information Only' or (modepref=='On Demand' and w.bp_requested_assessment!=selection):
+        result=[]; score=None; note='Information Only: assessment disabled.' if modepref=='Information Only' else note+' Select Show assessment for interpretation.'
+    w.set_rows(w.bp_tables['Assessment'],[(LABELS[k],str(weight)+'%',fmt(a,k),fmt(b,k),f'{na}/20 · {nb}/20',fmt(idx)) for k,weight,a,b,na,nb,idx in result])
+    if score is not None: note+=' · Weighted relative index '+fmt(score)+' (100 = previous personal baseline; component cap 200; at least 75% usable weight).'
+    if score is not None: note+=' · Historical comparison only; not a recommendation.'
+    elif result: note+=' · Insufficient usable metric coverage for a composite index.'
+    w.bp_assess_note.setText(note)
+    detail_bp(w)
+def detail_bp(w):
+    if not hasattr(w,'bp_visible'): return
+    i=w.bp_tables['Battles'].currentRow()
+    if not 0<=i<len(w.bp_visible): w.bp_detail.setText('Select a battle for details.'); return
+    r=w.bp_visible[i]; p=r['personal']; e=r['raw']
+    lines=[vehicle_title(w,r)+' · '+map_title(w,r)+' · '+r['outcome'],'Battle ID: '+r['id']+' · Sources: '+r['sources'],'Intended playstyle: '+r['style']]
+    for k in LABELS:
+        if k in r['stats']: lines.append(LABELS[k]+': '+fmt(r['stats'][k],k))
+    lines+=['Financial fields (reported; not inferred from account deltas):']
+    for k in ('originalCredits','credits','factualCredits','eventCredits','autoRepairCost','repair','autoLoadCost','autoEquipCost','autoEquipBoostersCost','originalXP','xp','originalFreeXP','freeXP','originalTMenXP','tmenXP','eventXP','eventFreeXP','appliedPremiumCreditsFactor100','appliedPremiumXPFactor100'):
+        if k in p: lines.append(k+': '+str(p[k]))
+    if r['config']: lines.append('Matched loadout: '+r['config']['label']+' ['+r['config']['id']+']')
+    else: lines.append('Battle configuration unavailable or ambiguous.')
+    if e['conflicts']: lines.append('Conflicting fields (excluded from aggregates): '+', '.join(e['conflicts']))
+    if r['status']=='awaiting_result': lines.append('Start observed, final result not captured. Retried on future scans; no outcome or earnings inferred.')
+    w.bp_detail.setText('\n'.join(lines))
+def navigate_bp(w,page_name):
+    if page_name=='History': refresh_bp(w,True)
+def performance_records(context):
+    # Public read-only service for future finance/progression/tactical modules.
+    root=getattr(context,'root',None)
+    if root is None: return {}
+    return obj(safe_read(Path(root)/'performance'/'unified_battles.json',{}).get('records'))
+def playstyle_profiles(context):
+    return {k:dict(v) for k,v in STYLES.items()}
+def register():
+    return {'services':{'battle_performance_records':performance_records,'playstyle_profiles':playstyle_profiles},'pages':[{'name':'History','order':70,'build':make_history}],'hooks':{'refresh':refresh_bp,'reset':reset_bp,'navigate':navigate_bp}}
