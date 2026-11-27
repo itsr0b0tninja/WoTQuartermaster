@@ -1,4 +1,5 @@
 name: Build WoTQuartermaster 0.5.0 Financial Advisor
+# Regression fixture uses the game's half-up credit rounding.
 on:
   push:
     branches: [main]

@@ -76,7 +76,7 @@ def finance_entry():
 def fin_namespace():
     ns={'__file__':str(FIN)}; exec(compile(FIN.read_bytes(),str(FIN),'exec'),ns); return ns
 def fixture_row(ns,vid='100',original=6907,style='Hybrid Scout',mode='random_pvp',i=1):
-    p=dict(originalCredits=original,subtotalCredits=round(original*1.5),credits=round(original*1.5),appliedPremiumCreditsFactor100=150,autoRepairCost=924,repair=924,autoLoadCost=[200,0],autoEquipCost=[0,0,0],autoEquipBoostersCost=[0,0,0],eventCredits=0)
+    p=dict(originalCredits=original,subtotalCredits=(original*3+1)//2,credits=(original*3+1)//2,appliedPremiumCreditsFactor100=150,autoRepairCost=924,repair=924,autoLoadCost=[200,0],autoEquipCost=[0,0,0],autoEquipBoostersCost=[0,0,0],eventCredits=0)
     return dict(id=str(i),account='a'*24,at=1700000000+i,vehicle=vid,vehicle_name='Tank '+vid,mode=mode,style=style,objective=style,purpose='Career',eligible=True,personal=p,raw={'data':{'personal':{'avatar':{'credits':p['credits']+60000,'eventCredits':60000}}}})
 def tank(vid,tier=3):
     return dict(intCD=int(vid),invID=int(vid),userName='Tank '+vid,level=tier,type='lightTank',isLocked=False,isRented=False,modules={'gun':{'intCD':9}},crew_slots=[{'crew_id':1}],shells_layout=[{'intCD':3,'count':20}],optDevices=[{}])
