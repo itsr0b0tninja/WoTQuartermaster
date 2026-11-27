@@ -49,31 +49,18 @@
       "url": "https://github.com/itsr0b0tninja/WoTQuartermaster/releases/download/crew-v0.1.0/crew.qmodule",
       "version": "0.1.0"
     },
-    "diagnostic": {
-      "api": 1,
-      "asset": "diagnostic.qmodule",
-      "channel": "alpha",
-      "dependencies": {},
-      "min_core": "0.3.2",
-      "release": "diagnostic-v0.1.0",
-      "required": true,
-      "sha256": "8165aa5ad09d30036f75329407129b9af53a8e334798110bb54bec2ccb6f5319",
-      "size": 943,
-      "url": "https://github.com/itsr0b0tninja/WoTQuartermaster/releases/download/diagnostic-v0.1.0/diagnostic.qmodule",
-      "version": "0.1.0"
-    },
     "garage": {
       "api": 1,
       "asset": "garage.qmodule",
       "channel": "alpha",
       "dependencies": {},
       "min_core": "0.3.2",
-      "release": "garage-v0.1.1",
+      "release": "garage-v0.1.2",
       "required": true,
-      "sha256": "7a0ceb2802a41bd73848626c5feffa41ffa2debd7bd42c8a55e98994afb14730",
+      "sha256": "746b2b0f0ded48268ebd7657b3513f0fba25a9c1a59f4816128fdc2b30584d2d",
       "size": 8171,
-      "url": "https://github.com/itsr0b0tninja/WoTQuartermaster/releases/download/garage-v0.1.1/garage.qmodule",
-      "version": "0.1.1"
+      "url": "https://github.com/itsr0b0tninja/WoTQuartermaster/releases/download/garage-v0.1.2/garage.qmodule",
+      "version": "0.1.2"
     },
     "inventory": {
       "api": 1,
@@ -115,6 +102,8 @@
       "version": "0.1.0"
     }
   },
-  "retired_modules": [],
+  "retired_modules": [
+    "diagnostic"
+  ],
   "schema": 1
 }
