@@ -1,0 +1,37 @@
+name: Test C - Garage 0.1.2 and Diagnostic retirement
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/garage-0.1.2-release.yml'
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: module-manifest-publication
+  cancel-in-progress: false
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Verify module-only change
+        run: python .github/scripts/publish_garage_0_1_2.py
+      - name: Publish module and verified manifest
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git fetch origin main
+          git checkout -B main origin/main
+          python .github/scripts/publish_garage_0_1_2.py --publish
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add components.json
+          if ! git diff --cached --quiet; then
+            git commit -m "Publish Garage 0.1.2 and retire temporary Diagnostic module"
+            git push origin main
+          fi
