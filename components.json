@@ -18,11 +18,11 @@
       "asset": "WoTQuartermaster.exe",
       "channel": "alpha",
       "min_desktop": "0.2.0",
-      "release": "v0.3.3",
-      "sha256": "58a8540078d6bf5df4b97f0bf667bb98a48dd023acbe3c7a62646c49097e0211",
-      "size": 55810315,
-      "url": "https://github.com/itsr0b0tninja/WoTQuartermaster/releases/download/v0.3.3/WoTQuartermaster.exe",
-      "version": "0.3.3"
+      "release": "v0.4.1",
+      "sha256": "9d2fe53e19ced1a99a41e9ad2b3cc6cee0fb7406f612984529be95a779ec515e",
+      "size": 55811132,
+      "url": "https://github.com/itsr0b0tninja/WoTQuartermaster/releases/download/v0.4.1/WoTQuartermaster.exe",
+      "version": "0.4.1"
     },
     "replay_parser": {
       "asset": "WoT_Quartermaster_Replay_Parser.txt",
@@ -41,13 +41,13 @@
       "asset": "battle_performance.qmodule",
       "channel": "alpha",
       "dependencies": {},
-      "min_core": "0.3.3",
-      "release": "battle_performance-v0.1.0",
+      "min_core": "0.4.1",
+      "release": "battle_performance-v0.1.1",
       "required": true,
-      "sha256": "6682af0b00544627d60affceeb4dc14c1a4e1bf980fc1a941073dfdcf87ee8f9",
-      "size": 41217,
-      "url": "https://github.com/itsr0b0tninja/WoTQuartermaster/releases/download/battle_performance-v0.1.0/battle_performance.qmodule",
-      "version": "0.1.0"
+      "sha256": "e22f66322efea14a42bb9f11729c4f085d53671fc4e6851d8a421c8bdb926441",
+      "size": 38749,
+      "url": "https://github.com/itsr0b0tninja/WoTQuartermaster/releases/download/battle_performance-v0.1.1/battle_performance.qmodule",
+      "version": "0.1.1"
     },
     "crew": {
       "api": 1,
@@ -115,7 +115,7 @@
       "version": "0.1.0"
     }
   },
-  "product_version": "0.4.0",
+  "product_version": "0.4.1",
   "retired_modules": [
     "diagnostic"
   ],
