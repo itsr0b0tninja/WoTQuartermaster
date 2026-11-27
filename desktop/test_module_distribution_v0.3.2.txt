@@ -1,0 +1,100 @@
+# Test independent module updates using a synthetic official manifest and HTTP response.
+import hashlib, io, json, os, shutil, subprocess, sys, tempfile, threading, time
+from pathlib import Path
+from module_manager import ModuleManager, ROOT, validate_modules
+from module_runtime import resource_folder
+cancel=threading.Event()
+def entry(mid,ver,raw,required=True,deps=None):
+    return dict(version=ver,api=1,min_core='0.3.2',dependencies=deps or {},size=len(raw),sha256=hashlib.sha256(raw).hexdigest(),release=mid+'-v'+ver,asset=mid+'.qmodule',url=ROOT+mid+'-v'+ver+'/'+mid+'.qmodule',channel='alpha',required=required)
+def fixture():
+    source=(resource_folder()/'garage.qmodule').read_bytes()
+    source=source.replace(b"'version':'0.1.0'",b"'version':'0.1.1'").replace(b"'min_core':'0.3.1'",b"'min_core':'0.3.2'")
+    assert b"'version':'0.1.1'" in source
+    diagnostic=b"""MODULE={'id':'diagnostic','version':'0.1.0','api':1,'min_core':'0.3.2','dependencies':{}}
+def build(window):
+    w,l=page(); heading(l,'Module diagnostic','Independent module installed'); window.add_page('Module diagnostic',w)
+def register(): return {'pages':[{'name':'Module diagnostic','order':75,'build':build}]}
+"""
+    a=entry('garage','0.1.1',source); b=entry('diagnostic','0.1.0',diagnostic)
+    offered={'garage':a,'diagnostic':b}; assets={a['url']:source,b['url']:diagnostic}
+    return offered,assets
+def reject(fn):
+    try: fn()
+    except (ValueError,OSError,InterruptedError): return
+    raise AssertionError('Unsafe module change accepted')
+def exercise(base):
+    mm=ModuleManager(base); r=mm.start(); assert r.ready(),r.errors
+    flat=base/'modules'; (flat/'unrelated.txt').write_text('keep')
+    offered,assets=fixture(); opener=lambda url:io.BytesIO(assets[url])
+    target=mm.plan(offered,[]); assert target['garage']['version']=='0.1.1' and 'diagnostic' in target
+    bad=dict(offered['garage'],url='https://evil.example/garage.qmodule')
+    reject(lambda:validate_modules({'modules':{'garage':bad}}))
+    reject(lambda:mm.stage(target,lambda url:io.BytesIO(b'bad'),cancel))
+    assert not mm.state['pending'] and not list(mm.sets.iterdir())
+    cancel.set(); reject(lambda:mm.stage(target,opener,cancel)); cancel.clear()
+    assert not list(mm.sets.iterdir())
+    assert mm.stage(target,opener,cancel); assert r.entries['garage']['version']=='0.1.0'
+    # Unconfirmed activation is rejected at next startup.
+    t=ModuleManager(base); assert t.start().ready(); assert t.state['trial']
+    restore=ModuleManager(base); assert restore.start().entries['garage']['version']=='0.1.0'
+    assert restore.state['hold'] and not restore.state['pending']
+    assert restore.stage(target,opener,cancel,manual=True)
+    t=ModuleManager(base); r=t.start(); assert r.ready(),r.errors
+    assert r.entries['garage']['version']=='0.1.1' and 'diagnostic' in r.loaded
+    assert any(p['name']=='Module diagnostic' for p in r.pages)
+    t.confirm(); assert t.state['has_previous']
+    t.stage_rollback('garage',opener,cancel,lambda n,t:None)
+    t=ModuleManager(base); r=t.start(); assert r.ready(); t.confirm()
+    assert r.entries['garage']['version']=='0.1.0' and 'diagnostic' in r.loaded and t.state['hold']
+    target=t.plan({},['diagnostic'],manual=True)
+    assert t.stage(target,opener,cancel,manual=True)
+    t=ModuleManager(base); r=t.start(); assert r.ready(); t.confirm()
+    assert 'diagnostic' not in r.loaded and (flat/'unrelated.txt').read_text()=='keep'
+    assert len(list(t.sets.iterdir()))<=2
+    # Missing/incompatible deps never become active.
+    bad=dict(offered['diagnostic'],dependencies={'missing':'0.1.0'})
+    reject(lambda:t.plan({'diagnostic':bad},[],manual=True))
+    # Optional modules not installed unless selected.
+    optional=dict(offered['diagnostic'],required=False)
+    assert 'diagnostic' not in t.plan({'diagnostic':optional},[],manual=True)
+    assert 'diagnostic' in t.plan({'diagnostic':optional},[],selected=['diagnostic'],manual=True)
+    print('Independent transaction, download rejection, cancellation, interrupted trial, rollback, retirement, optional install and cleanup passed')
+def compiled(exe):
+    with tempfile.TemporaryDirectory(prefix='qm-module-ci-') as tmp:
+        base=Path(tmp); target=base/'WoTQuartermaster.exe'; shutil.copyfile(exe,target); original=hashlib.sha256(target.read_bytes()).hexdigest()
+        (base/'settings.ini').write_text('[Desktop]\nupdate_checks = no\n')
+        env=dict(os.environ,QT_QPA_PLATFORM='offscreen',PYINSTALLER_RESET_ENVIRONMENT='1')
+        def launch(expect):
+            proc=subprocess.Popen([str(target)],cwd=base,env=env)
+            try:
+                deadline=time.monotonic()+55
+                while time.monotonic()<deadline:
+                    if proc.poll() is not None: raise RuntimeError('Compiled module startup exited')
+                    p=base/'modules'/'module-state.json'
+                    if p.exists():
+                        state=json.loads(p.read_text())
+                        if state.get('active')==expect and not state.get('trial') and not state.get('pending'): break
+                    elif expect is None and (base/'modules'/'installed.json').exists() and (base/'data'/'database'/'quartermaster.sqlite3').exists(): break
+                    time.sleep(.5)
+                else: raise RuntimeError('Compiled module activation not confirmed')
+                assert hashlib.sha256(target.read_bytes()).hexdigest()==original
+            finally:
+                subprocess.run(['taskkill','/PID',str(proc.pid),'/T','/F'],capture_output=True,timeout=15)
+                proc.wait(timeout=15); time.sleep(2)
+                # Forced CI shutdown leaves a QLockFile; clean only the isolated fixture.
+                (base/'updates'/'desktop.lock').unlink(missing_ok=True)
+        launch(None)
+        mm=ModuleManager(base); assert mm.start().ready()
+        offered,assets=fixture(); opener=lambda url:io.BytesIO(assets[url])
+        assert mm.stage(mm.plan(offered,[]),opener,cancel); launch(mm.state['pending'])
+        mm=ModuleManager(base); r=mm.start(); assert r.ready() and 'diagnostic' in r.loaded and r.entries['garage']['version']=='0.1.1'
+        mm.stage_rollback('garage',opener,cancel,lambda n,t:None); launch(mm.state['pending'])
+        mm=ModuleManager(base); r=mm.start(); assert r.ready() and r.entries['garage']['version']=='0.1.0'
+        mm.stage(mm.plan({},['diagnostic'],manual=True),opener,cancel,manual=True); launch(mm.state['pending'])
+        mm=ModuleManager(base); r=mm.start(); assert r.ready() and 'diagnostic' not in r.loaded
+        assert hashlib.sha256(target.read_bytes()).hexdigest()==original
+        print('Compiled executable unchanged across module-only update, new module discovery, rollback and retirement')
+if __name__=='__main__':
+    if len(sys.argv)>1: compiled(Path(sys.argv[1]))
+    else:
+        with tempfile.TemporaryDirectory() as tmp: exercise(Path(tmp))
