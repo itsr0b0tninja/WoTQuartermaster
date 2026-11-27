@@ -36,6 +36,19 @@
     }
   },
   "modules": {
+    "battle_performance": {
+      "api": 1,
+      "asset": "battle_performance.qmodule",
+      "channel": "alpha",
+      "dependencies": {},
+      "min_core": "0.3.3",
+      "release": "battle_performance-v0.1.0",
+      "required": true,
+      "sha256": "6682af0b00544627d60affceeb4dc14c1a4e1bf980fc1a941073dfdcf87ee8f9",
+      "size": 41217,
+      "url": "https://github.com/itsr0b0tninja/WoTQuartermaster/releases/download/battle_performance-v0.1.0/battle_performance.qmodule",
+      "version": "0.1.0"
+    },
     "crew": {
       "api": 1,
       "asset": "crew.qmodule",
@@ -102,7 +115,7 @@
       "version": "0.1.0"
     }
   },
-  "product_version": "0.3.3",
+  "product_version": "0.4.0",
   "retired_modules": [
     "diagnostic"
   ],
