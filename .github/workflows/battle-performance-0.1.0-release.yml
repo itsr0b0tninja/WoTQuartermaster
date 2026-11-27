@@ -1,0 +1,42 @@
+name: Publish WoTQuartermaster 0.4.0 Battle Performance
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/battle-performance-0.1.0-release.yml'
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: module-manifest-publication
+  cancel-in-progress: false
+jobs:
+  publish:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Verify battle module and calculations
+        run: python .github/scripts/publish_battle_performance_0_1_0.py
+      - name: Test existing compiled executable with new module
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python .github/scripts/publish_battle_performance_0_1_0.py --compiled
+      - name: Publish verified module and manifest
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git fetch origin main
+          git checkout -B main origin/main
+          python .github/scripts/publish_battle_performance_0_1_0.py --publish
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add components.json
+          if ! git diff --cached --quiet; then
+            git commit -m "Publish product 0.4.0 and verified Battle Performance module"
+            git push origin main
+          fi
