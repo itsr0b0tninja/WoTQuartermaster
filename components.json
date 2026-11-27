@@ -49,6 +49,19 @@
       "url": "https://github.com/itsr0b0tninja/WoTQuartermaster/releases/download/crew-v0.1.0/crew.qmodule",
       "version": "0.1.0"
     },
+    "diagnostic": {
+      "api": 1,
+      "asset": "diagnostic.qmodule",
+      "channel": "alpha",
+      "dependencies": {},
+      "min_core": "0.3.2",
+      "release": "diagnostic-v0.1.0",
+      "required": true,
+      "sha256": "8165aa5ad09d30036f75329407129b9af53a8e334798110bb54bec2ccb6f5319",
+      "size": 943,
+      "url": "https://github.com/itsr0b0tninja/WoTQuartermaster/releases/download/diagnostic-v0.1.0/diagnostic.qmodule",
+      "version": "0.1.0"
+    },
     "garage": {
       "api": 1,
       "asset": "garage.qmodule",
