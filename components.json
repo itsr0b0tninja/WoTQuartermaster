@@ -54,13 +54,13 @@
       "asset": "garage.qmodule",
       "channel": "alpha",
       "dependencies": {},
-      "min_core": "0.3.1",
-      "release": "garage-v0.1.0",
+      "min_core": "0.3.2",
+      "release": "garage-v0.1.1",
       "required": true,
-      "sha256": "690c25e537b6148db604bafcdcec81432a238709428ca3a254d5eb9f7f97a2df",
-      "size": 8236,
-      "url": "https://github.com/itsr0b0tninja/WoTQuartermaster/releases/download/garage-v0.1.0/garage.qmodule",
-      "version": "0.1.0"
+      "sha256": "7a0ceb2802a41bd73848626c5feffa41ffa2debd7bd42c8a55e98994afb14730",
+      "size": 8171,
+      "url": "https://github.com/itsr0b0tninja/WoTQuartermaster/releases/download/garage-v0.1.1/garage.qmodule",
+      "version": "0.1.1"
     },
     "inventory": {
       "api": 1,
