@@ -291,13 +291,21 @@ def retention(rows,tree,scores,refs,g,owned,known,choices,alternatives,snapshots
         cs=snapshots[sty]; relevant=[k for k in cs['path'] if k==cs['current'] or k not in owned]
         for k in relevant:
             remaining.add(k); protect(k,sty+' career')
-        # Missing evidence can alter a ranking. Do not liquidate assets that
-        # would be needed by an unresolved competing route.
+        # Protect the best separate X alternative, strongest natural-fit
+        # endpoint and near-tied routes while the end-game choice is tested.
+        # The five-point window is the already approved route stability rule.
+        cohort=[a for a in alternatives[sty] if tier(rows[a['destination']])==tier(rows[r['destination']])]
+        best_x=next((a for a in alternatives[sty] if tier(rows[a['destination']])==10),None)
+        natural=max(cohort,key=lambda a:a.get('end',-1),default=None)
         for alt in alternatives[sty]:
-            if tier(rows[alt['destination']])!=tier(rows[r['destination']]): continue
-            if alt['xp'] is None or alt['credits'] is None or alt.get('missing_fit'):
-                for k in alt['path']:
-                    remaining.add(k); protect(k,sty+' uncertain route')
+            same=tier(rows[alt['destination']])==tier(rows[r['destination']])
+            uncertain=alt['xp'] is None or alt['credits'] is None or alt.get('missing_fit')
+            close=same and number(alt.get('rank')) is not None and number(r.get('rank')) is not None and alt['rank']>=r['rank']-5
+            if (same and uncertain) or close or alt is best_x or alt is natural:
+                ac=career_snapshot(alt,owned)
+                for k in ac['path']:
+                    if k==ac['current'] or k not in owned:
+                        remaining.add(k); protect(k,sty+' end-game alternative')
     # All currently proven profitable ready vehicles stay available.
     for p in profiles:
         if p.get('ready') and p['profile'].get('n',0)>=5 and (p['profile'].get('average') or 0)>0:
@@ -485,24 +493,23 @@ def coordinate(w,force=False):
     settings=w.settings.values; style=settings.get('playstyle'); advisor=settings.get('advisor_mode','Full Advisor')
     if m.state in ('matchmaking','battle_loading','in_battle'): return
     w.next_action_request.setVisible(advisor=='On Demand')
-    if style=='Profit':
-        # Finance remains the Profit specialist; no progression state is changed.
-        w.prog_finance_target=None; w.prog_stamp=None; w.prog_last=None; w.prog_vehicle_details=[]
-        w.prog_note.setText('Profit has no permanent technology-tree destination. Select a combat playstyle to resume its career.')
-        for t in w.prog_tables.values(): w.set_rows(t,[])
-        return
-    if style not in WEIGHTS: return
+    profit=style=='Profit'
+    if profit: w.prog_finance_target=None
+    if not profit and style not in WEIGHTS: return
     a=identity(m); g=m.garage_data
     if m.state!='garage' or not a or g.status('garage') not in ('ok','empty') or g.status('research') not in ('ok','empty') or not g.catalogue.identity:
         w.prog_finance_target=None; w.prog_vehicle_details=[]; w.prog_last=None
         w.prog_note.setText('Waiting for verified live garage, research and catalogue data. Saved careers are retained.')
         for t in w.prog_tables.values(): w.set_rows(t,[])
         w.prog_stamp=None
-        action(w,'Waiting for live garage data','No spending or vehicle-switch advice from an unconfirmed snapshot.'); return
+        if not profit: action(w,'Waiting for live garage data','No spending or vehicle-switch advice from an unconfirmed snapshot.')
+        return
     rows=g.catalogue.category('vehicles')
     if not rows:
         w.prog_finance_target=None; w.prog_stamp=None
-        action(w,'Catalogue unavailable','Wait for the matching complete game catalogue.'); return
+        for t in w.prog_tables.values(): w.set_rows(t,[])
+        if not profit: action(w,'Catalogue unavailable','Wait for the matching complete game catalogue.')
+        return
     records=getattr(w,'bp_rows',[])
     finance=w.runtime.loaded.get('finance'); balance=nonneg(m.account.get('credits'))
     selected=key(m.selected.get('tank_id')); premium=finance.premium_basis(m,settings.get('strategy')) if finance else False
@@ -515,7 +522,11 @@ def coordinate(w,force=False):
         tree=graph(rows); scores,refs=catalogue_scores(rows,tree,g.catalogue.category('guns',True)); w.prog_static=(g.catalogue.identity,tree,scores,refs)
     _,tree,scores,refs=w.prog_static
     known=unlocked_set(g)
-    if known is None: action(w,'Waiting for research data','Unlocks are not confirmed.'); return
+    if known is None:
+        w.prog_finance_target=None
+        for t in w.prog_tables.values(): w.set_rows(t,[])
+        if not profit: action(w,'Waiting for research data','Unlocks are not confirmed.')
+        return
     owned={key(v.get('intCD')):v for v in m.garage if key(v.get('intCD')) in rows}
     known.update(owned); xps={str(k):v for k,v in obj(obj(g.section('research')).get('vehicle_xp')).items()}
     for k,v in owned.items():
@@ -531,6 +542,23 @@ def coordinate(w,force=False):
         choices,alternatives,snapshots=all_careers(rows,tree,scores,owned,known,xps,g,live,[c for c in crew if isinstance(c,dict)],careers)
         w.prog_route_cache=(route_key,choices,alternatives,snapshots)
     else: _,choices,alternatives,snapshots=cached
+    changed=any(careers.get(sty)!=new for sty,new in snapshots.items())
+    if changed:
+        careers.update(snapshots)
+        try: save_state(path,data)
+        except OSError: logging.exception('Career state could not be saved')
+    if profit:
+        # Profit retains Finance's single next action. Still assess all owned
+        # assets immediately without changing the selected objective.
+        profiles=finance.profiles([finance.finance_row(r) for r in usable],m.garage,mode,'Profit',premium) if finance else []
+        ret,sales,complete,unknown=retention(rows,tree,scores,refs,g,owned,known,choices,alternatives,snapshots,profiles)
+        for t in w.prog_tables.values(): w.set_rows(t,[])
+        w.prog_vehicle_details=[]
+        w.set_rows(w.prog_tables['Garage & Depot'],ret)
+        w.set_rows(w.prog_tables['Overview'],[('Selected objective','Profit'),('All combat careers assessed',str(len(choices))+' / 10'),('Potential verified sale quotes',fmt(sum(x['price'] for x in sales))+' credits · optional, not included in balance')])
+        w.set_rows(w.prog_tables['Data Quality'],[('End-game coverage',str(len(choices))+' / 10','Sales held if incomplete'),('Missing depot compatibility',', '.join(sorted(unknown)) or 'None detected','Unknown categories held'),('Acquisition and potential fit','Incomplete','See individual career Data Quality tabs')])
+        w.prog_note.setText('Profit objective · all combat careers and garage assets assessed. Finance retains the next action.')
+        return
     candidates=alternatives[style]; route=choices.get(style)
     if not route:
         w.prog_finance_target=None; w.prog_last=None; w.prog_vehicle_details=[]
@@ -541,11 +569,6 @@ def coordinate(w,force=False):
     route_path=route['path']; pos=max((i for i,k in enumerate(route_path) if k in owned),default=-1)
     current=route_path[pos] if pos>=0 else None
     target=route_path[pos+1] if pos+1<len(route_path) else None
-    changed=any(careers.get(sty)!=new for sty,new in snapshots.items())
-    if changed:
-        careers.update(snapshots)
-        try: save_state(path,data)
-        except OSError: logging.exception('Career state could not be saved')
     profiles=finance.profiles([finance.finance_row(r) for r in usable],m.garage,mode,'Profit',premium) if finance else []
     # Use intended role for the career tank; alternative credit profiles retain their observed role.
     career_profiles=finance.profiles([finance.finance_row(r) for r in usable],m.garage,mode,style,premium) if finance else []
@@ -586,6 +609,9 @@ def coordinate(w,force=False):
     if sales: details.append(('Optional sale candidates',', '.join(x['name'] for x in sales[:5])+' · see Garage & Depot'))
     tier10=next((c for c in candidates if tier(rows[c['destination']])==10),None)
     if tier10: details.append(('Best separate Tier X route',title(rows,tier10['destination'])+' · rank '+fmt(tier10['rank'])))
+    for level in ENDGAME_TIERS:
+        best_fit=max((k for k in tree if tier(rows[k])==level and obj(obj(scores.get(k)).get(style)).get('score') is not None),key=lambda k:(scores[k][style]['score'],k),default=None)
+        if best_fit: details.append(('Best natural fit at Tier '+str(level),title(rows,best_fit)+' · '+fmt(scores[best_fit][style]['score'])+' / 100 (stock)'))
     w.set_rows(w.prog_tables['Garage & Depot'],retention_rows)
     w.set_rows(w.prog_tables['Data Quality'],data_quality(rows,tree,scores,style,candidates,choices,unknown,g,refs))
     w.set_rows(w.prog_tables['Overview'],details)
