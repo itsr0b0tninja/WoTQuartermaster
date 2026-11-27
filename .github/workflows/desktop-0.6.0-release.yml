@@ -1,0 +1,77 @@
+name: Build WoTQuartermaster 0.6.0 Progression Advisor
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/desktop-0.6.0-release.yml'
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: module-manifest-publication
+  cancel-in-progress: false
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          architecture: x64
+      - name: Install build dependencies
+        run: python -m pip install --disable-pip-version-check PySide6==6.8.3 Pillow==11.3.0 PyInstaller==6.14.2
+      - name: Verify source and run regression tests
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ((git hash-object desktop/WoTQuartermaster_v0.6.0.txt).Trim() -ne '6d8616cd1b69434dce3b14ae309ae081bcf4fdbd') { throw 'Source hash mismatch: desktop/WoTQuartermaster_v0.6.0.txt' }
+          if ((git hash-object modules/progression/0.1.0/progression.qmodule).Trim() -ne '6849575a8e37458f78b97fc88110fa2cd8ce81fe') { throw 'Source hash mismatch: modules/progression/0.1.0/progression.qmodule' }
+          if ((git hash-object modules/finance/0.1.1/finance.qmodule).Trim() -ne '1a6635c96bba48a335f005c36985a42db4811987') { throw 'Source hash mismatch: modules/finance/0.1.1/finance.qmodule' }
+          if ((git hash-object modules/battle_performance/0.1.3/battle_performance.qmodule).Trim() -ne '9102f9fd8b6fac3bcca469fcd9766c4dda4525a5') { throw 'Source hash mismatch: modules/battle_performance/0.1.3/battle_performance.qmodule' }
+          if ((git hash-object modules/research/0.1.1/research.qmodule).Trim() -ne 'a90b839a687d93c3b832d18046ec4b9faf8ae60c') { throw 'Source hash mismatch: modules/research/0.1.1/research.qmodule' }
+          python .github/scripts/build_module_index_0_3_2.py
+          if ($LASTEXITCODE -ne 0) { throw 'Index generation failed' }
+          Copy-Item desktop/module_manager_online.py module_manager_online.py
+          Copy-Item desktop/module_manager.py module_manager.py
+          Copy-Item desktop/module_runtime.py module_runtime.py
+          Copy-Item desktop/module_shared.py module_shared.py
+          Copy-Item desktop/WoTQuartermaster_v0.6.0.txt WoTQuartermaster.py
+          python -m py_compile WoTQuartermaster.py
+          if ($LASTEXITCODE -ne 0) { throw 'Syntax failed' }
+          (Get-Content desktop/test_updater_v0.3.3.txt -Raw).Replace('desktop/WoTQuartermaster_v0.3.3.txt','desktop/WoTQuartermaster_v0.6.0.txt') | Set-Content -Encoding utf8 test-updater-060.py
+          python test-updater-060.py
+          if ($LASTEXITCODE -ne 0) { throw 'Updater regression failed' }
+          python .github/scripts/publish_0_6_0.py
+          if ($LASTEXITCODE -ne 0) { throw 'Progression and financial regressions failed' }
+          python .github/scripts/publish_0_6_0.py --ui
+          if ($LASTEXITCODE -ne 0) { throw 'Progression UI checks failed' }
+      - name: Compile portable Windows executable
+        shell: pwsh
+        run: |
+          python -m PyInstaller --noconfirm --clean --onefile --windowed --name WoTQuartermaster --hidden-import PIL.DdsImagePlugin --hidden-import PIL.Image --hidden-import PIL.PngImagePlugin --add-data "desktop/runtime_modules/index.json;runtime_modules" WoTQuartermaster.py
+          if ($LASTEXITCODE -ne 0) { throw 'Build failed' }
+          $exe = 'dist/WoTQuartermaster.exe'
+          $digest = (Get-FileHash $exe -Algorithm SHA256).Hash.ToLowerInvariant()
+          Set-Content -Path dist/WoTQuartermaster.sha256.txt -Value "$digest  WoTQuartermaster.exe" -Encoding ascii
+      - name: Verify compiled upgrade and module activation
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python .github/scripts/publish_0_6_0.py --compiled
+      - name: Publish verified core and modules
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git fetch origin main
+          git checkout -B main origin/main
+          python .github/scripts/publish_0_6_0.py --publish
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add components.json
+          if ! git diff --cached --quiet; then
+            git commit -m "Publish verified WoTQuartermaster 0.6.0 core and progression modules"
+            git push origin main
+          fi
