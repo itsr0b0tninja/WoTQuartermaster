@@ -68,7 +68,7 @@ def category_scores(attrs,ref,style):
         scores.append(sum(s*w for s,w in valid)/total if total>=40 else None); coverage.append(total)
     w=WEIGHTS[style]; used=sum(a for a,s in zip(w,scores) if s is not None)
     overall=sum(a*s for a,s in zip(w,scores) if s is not None)/used if used>=75 else None
-    return {'score':overall,'categories':scores,'coverage':sum(a*c for a,c in zip(w,coverage))/100}
+    return {'score':overall,'categories':scores,'coverage':sum(a*c for a,c in zip(w,coverage))/100,'available_fields':tuple(sorted(k for group in groups(style) for k,_ in group if attrs.get(k) is not None and ref.get(k)))}
 def shot_for(g,gun):
     shots=seq(g.get(str(gun),{}).get('shots'))
     return next((s for s in shots if number(obj(s).get('defaultPortion')) is not None and s['defaultPortion']>0.5),None)
@@ -286,7 +286,7 @@ def retention(rows,tree,scores,refs,g,owned,known,choices,alternatives,snapshots
     # including current stage, plus any unresolved end-game alternatives.
     protected={}; remaining=set()
     def protect(k,why): protected.setdefault(k,set()).add(why)
-    complete=set(choices)==set(WEIGHTS) and all(tier(rows[r['destination']])>=10 for r in choices.values())
+    complete=set(choices)==set(WEIGHTS) and all(tier(rows[r['destination']])>=10 and tier(rows[r['destination']])==max((tier(rows[k]) for k in tree if artillery(rows[k])==(sty=='Artillery Support')),default=0) for sty,r in choices.items())
     for sty,r in choices.items():
         cs=snapshots[sty]; relevant=[k for k in cs['path'] if k==cs['current'] or k not in owned]
         for k in relevant:
@@ -317,7 +317,7 @@ def retention(rows,tree,scores,refs,g,owned,known,choices,alternatives,snapshots
             # Do not compare mismatched data coverage as though equal.
             replacement=any(j!=k and tier(rows[j])>=tier(rows[k]) and ready(owned[j]) and
                 fits[j].get('score') is not None and live[j] is not None and
-                fits[j].get('coverage')==f.get('coverage') and live[j].get('coverage')==a.get('coverage') and
+                fits[j].get('coverage')==f.get('coverage') and live[j].get('coverage')==a.get('coverage') and fits[j].get('available_fields')==f.get('available_fields') and live[j].get('available_fields')==a.get('available_fields') and owned[j].get('isRented') is False and
                 fits[j]['score']>f['score'] and live[j]['score']>a['score'] for j in eligible)
             if not replacement: protect(k,'Best/undominated for '+sty)
     result=[]; sales=[]
@@ -508,7 +508,7 @@ def coordinate(w,force=False):
     selected=key(m.selected.get('tank_id')); premium=finance.premium_basis(m,settings.get('strategy')) if finance else False
     usable=[r for r in records if r.get('account')==a and r.get('mode') in MODES and r.get('eligible') and r.get('at') is not None]
     mode=max(usable,key=lambda r:r['at'])['mode'] if usable else 'random_pvp'
-    stamp=(str(m.root),a,g.catalogue.identity,m.garage_signature,id(records),style,selected,balance,m.account.get('free_xp'),m.account.get('premium_expiry'),premium,advisor,bool(getattr(w,'finance_requested',False)))
+    stamp=(str(m.root),a,g.catalogue.identity,m.garage_signature,obj(m.sources.get('diagnostics')).get('revision'),id(records),style,selected,balance,m.account.get('free_xp'),m.account.get('premium_expiry'),premium,advisor,bool(getattr(w,'finance_requested',False)))
     if stamp==w.prog_stamp and not force: return
     w.prog_stamp=stamp
     if w.prog_static is None or w.prog_static[0]!=g.catalogue.identity:
@@ -525,7 +525,7 @@ def coordinate(w,force=False):
     path=m.root/'progression'/'careers.json'; data=load_state(path); state=data['accounts'].setdefault(a,{'careers':{}}); careers=state.setdefault('careers',{})
     # Reassess all ten styles, including never-selected styles, on every
     # materially different account/research snapshot, preserving independent state.
-    route_key=(a,g.catalogue.identity,m.garage_signature,tuple(sorted(known)),tuple(sorted(xps.items())),json.dumps(live,sort_keys=True) if not live else tuple(sorted((k,str(v)) for k,v in live.items())))
+    route_key=(a,g.catalogue.identity,m.garage_signature,tuple(sorted(owned)),tuple(sorted(known)),tuple(sorted(xps.items())),tuple(sorted((k,str(v)) for k,v in live.items())),hashlib.sha256(json.dumps(g.section('current_shop_prices'),sort_keys=True,default=str).encode()).hexdigest(),hashlib.sha256(json.dumps(crew,sort_keys=True,default=str).encode()).hexdigest())
     cached=getattr(w,'prog_route_cache',None)
     if cached is None or cached[0]!=route_key:
         choices,alternatives,snapshots=all_careers(rows,tree,scores,owned,known,xps,g,live,[c for c in crew if isinstance(c,dict)],careers)
@@ -628,6 +628,8 @@ def coordinate(w,force=False):
         # If XP can complete a prerequisite, advise that exact action before playing more.
         if plan and available_xp is not None and available_xp>=plan[0]['xp']:
             action(w,'Research '+title(allitems,plan[0]['id']),'Required for '+target_name+'. '+optional); return
+        if current and plan is None:
+            action(w,'Review research prerequisites for '+target_name,'The exported dependency chain is incomplete. Check the Data Quality tab and the in-game research screen before spending XP.'); return
         if current and ready(owned[current]):
             # Required research is actionable. Optional investments require
             # verified configuration and cost/remaining-grind evidence;
