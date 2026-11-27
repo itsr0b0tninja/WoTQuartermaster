@@ -145,6 +145,11 @@ with tempfile.TemporaryDirectory() as tmp:
     w.settings.values['playstyle']=style
     assert refresh(w)=='Review purchase of Tank 34'
     assert w.prog_finance_target['id']=='34'
+    before=w.next_action_title.text
+    w.settings.values['playstyle']='Profit'; refresh(w)
+    assert w.next_action_title.text==before and w.prog_finance_target is None
+    assert w.prog_tables['Garage & Depot'].rows
+    w.settings.values['playstyle']=style
     w.model.sources['diagnostics']['session']='stale'
     assert refresh(w)=='Waiting for live garage data'
 with tempfile.TemporaryDirectory() as tmp:
@@ -191,9 +196,25 @@ assert next(x for x in ro if x[1]=='Tank 33')[3]=='Keep'
 # An older tank protected by a different career cannot be sold.
 sty='Defensive Fighter'; prev=sn[sty]; sn[sty]=dict(prev,path=['17','49'],current='17')
 assert '17' not in {x['id'] for x in assess()[1]}; sn[sty]=prev
+# Near-tied end-game alternatives retain assets pending validation.
+ch[sty]['rank']=80
+alternative=dict(ch[sty],rank=76,path=['17','49'],full_path=['1','17','49'])
+alt[sty].append(alternative)
+assert '17' not in {x['id'] for x in assess()[1]}
+alt[sty].pop()
 # A tied best vehicle remains protected.
 rs['17'][style]['score']=80
 assert '17' not in {x['id'] for x in assess()[1]}; rs['17'][style]['score']=20
+# Best Tier X alternative remains protected under a Tier XI career.
+rr['81']=v('81',11,0); rr['81']['compatible_modules']=rr['49']['compatible_modules']; rt['81']=[]
+old_ch=dict(ch); old_sn=dict(sn); old_alt={k:list(x) for k,x in alt.items()}
+for sty in n['WEIGHTS']:
+    if sty=='Artillery Support':continue
+    r11=dict(ch[sty],destination='81',path=['33','49','81'],full_path=['1','33','49','81'],rank=80)
+    r10=dict(ch[sty],destination='49',path=['17','49'],full_path=['1','17','49'],rank=70)
+    ch[sty]=r11; sn[sty]=n['career_snapshot'](r11,own); alt[sty]=[r11,r10]
+assert '17' not in {x['id'] for x in assess()[1]}
+del rr['81'];del rt['81'];ch.clear();ch.update(old_ch);sn.clear();sn.update(old_sn);alt.clear();alt.update(old_alt)
 # Missing or mismatched configured data, mounted equipment and resale block.
 n['config_fit']=lambda rows,refs,g,v,sty,ge:None if str(v['intCD'])=='17' else rs[str(v['intCD'])].get(sty)
 assert '17' not in {x['id'] for x in assess()[1]}
