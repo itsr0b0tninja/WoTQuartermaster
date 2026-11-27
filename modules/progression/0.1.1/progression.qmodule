@@ -511,7 +511,8 @@ def coordinate(w,force=False):
         if plan and available_xp is not None and available_xp>=plan[0]['xp']:
             action(w,'Research '+title(allitems,plan[0]['id']),'Required for '+target_name+'. '+optional); return
         if current and ready(owned[current]):
-            upgrade=useful_engine_upgrade(g,rows,current,owned[current],style,known,balance,total) if gap is not None and gap>0 and plan is not None else None
+            upgrade_budget=total if q and q.get('complete') else None
+            upgrade=useful_engine_upgrade(g,rows,current,owned[current],style,known,balance,upgrade_budget) if gap is not None and gap>0 and plan is not None else None
             if upgrade:
                 action(w,'Mount '+upgrade['name'],'On '+current_name+': verified engine power improvement '+fmt(upgrade['gain'])+'%; '+('available in depot' if upgrade['cost']==0 else fmt(upgrade['cost'])+' credits, next-tank planning balance protected')+'. Continue towards '+target_name+'.'); return
             action(w,('Play ' if selected==current else 'Switch to ')+current_name,fmt(gap)+' XP remaining for '+target_name+'. '+optional)
@@ -519,7 +520,7 @@ def coordinate(w,force=False):
         else: action(w,'Review research route','No owned starting vehicle confirmed.')
         return
     if q and q['slots']==0:
-        action(w,'Free a garage slot','Review retention and optional sale candidates on Progression; do not sell a protected vehicle.'); return
+        action(w,'Free a garage slot','A garage slot is required for '+target_name+'. Review retention and optional sale candidates on Progression; do not sell a protected vehicle.'); return
     if q and q['purchase'] is not None and balance is not None:
         goal=total if total is not None else q['purchase']+(q['ammo'] or 0)+(q['reserve'] or 0)
         if balance<goal:
@@ -527,7 +528,7 @@ def coordinate(w,force=False):
                 vid=best['vehicle']; intent=dict(vehicle=vid,style=best['style'],objective=style,purpose='Credit grinding') if selected==vid else None
                 action(w,('Play ' if selected==vid else 'Switch to ')+best['name'],'Earn credits for '+target_name+'; at least '+fmt(goal-balance)+' credits short. Budget incomplete. '+reason,intent)
             elif current and ready(owned[current]): action(w,'Play '+current_name,'Earn credits for '+target_name+'; at least '+fmt(goal-balance)+' short. No better proven credit earner.')
-            else: action(w,'Earn credits','Purchase/preparation budget not yet met; no proven ready credit earner.')
+            else: action(w,'Earn credits','Save for '+target_name+'; at least '+fmt(goal-balance)+' credits short. Purchase/preparation budget incomplete; no proven ready credit earner.')
             return
         action(w,'Review purchase of '+target_name,'Ready to advance if the in-game purchase package and preparation costs fit your balance. Purchase and reported stocking estimates covered; verify outstanding crew, included ammunition, consumables and reserve. Total acquisition cost is not confirmed.'); return
     action(w,'Review '+target_name,'Research complete; exact purchase affordability is not confirmed.')

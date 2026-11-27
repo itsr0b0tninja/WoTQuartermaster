@@ -52,3 +52,89 @@ assert n['useful_engine_upgrade'](eng({}),rows,'17',vehicle,style,{'2'},100,100)
 assert n['useful_engine_upgrade'](eng({}),rows,'17',vehicle,style,{'2'},150,100)['cost']==50
 assert n['useful_engine_upgrade'](eng({}),rows,'17',vehicle,'Brawler',{'2'},150,100) is None
 print('PASS: new national entry, near-term tier, stable target, advancement, stock grants, migration, upgrade budget gates')
+
+# Exercise the real coordinator, including purchase/saving/research transitions.
+import tempfile, json
+class Control:
+    def __init__(self): self.text=''; self.visible=True
+    def setText(self,s): self.text=s
+    def setVisible(self,v): self.visible=v
+    def hide(self): self.visible=False
+    def currentRow(self): return -1
+class Cat:
+    identity='fixture-v2'
+    def category(self,k,enriched=False):
+        return rows if k=='vehicles' and not enriched else {}
+    def item(self,k,i,enriched=False): return {}
+def tank(k):
+    return {'intCD':int(k),'invID':int(k),'isLocked':False,'isRented':False,
+            'isElite':False,'isPremium':False,'combat_xp':0,
+            'modules':{'gun':{'intCD':4}},
+            'crew_slots':[{'crew_id':1}],'shells_layout':[{'count':5}]}
+def coordinator(root, initial, unlocked, credits=1000):
+    sections={'research':{'unlocked_item_ids':list(map(int,unlocked)),'initial_unlocks':[1,2],
+                          'vehicle_xp':{}},
+              'garage':{},'account_extra':{'free_vehicle_slots':3},
+              'depot':{'SHELL':{},'ENGINE':{}},'crew':{},'current_shop_prices':{}}
+    garage=[tank(k) for k in initial]
+    cat=Cat()
+    gg=SimpleNamespace(catalogue=cat,section=lambda k:sections.get(k),status=lambda k:'ok',
+                       vehicles={str(x['invID']):x for x in garage})
+    ss={k:{sty:{'score':scores[k][style]['score'],'categories':[50]*7,'coverage':100}
+           for sty in n['WEIGHTS'] if sty!='Artillery Support'} for k in rows}
+    account='a'*24
+    m=SimpleNamespace(root=root,state='garage',sources={'connector':{'session':'x','game_version':'v'},
+        'battle_context':{'session':'x','account_key':account},
+        'diagnostics':{'session':'x','game_version':'v'}},
+        account={'credits':credits,'free_xp':0},selected={'tank_id':int(initial[0]),'combat_xp':0},
+        garage=garage,garage_signature='fixture',garage_data=gg)
+    w=SimpleNamespace(model=m,settings=SimpleNamespace(values={'playstyle':style,'advisor_mode':'Full Advisor'}),
+        runtime=SimpleNamespace(loaded={}),prog_tables={k:Control() for k in
+            ('Overview','Career','Technology Trees','Vehicles','Research')},
+        prog_stamp=None,prog_static=(cat.identity,tree,ss,{}),prog_discovery=Control(),
+        prog_dismiss=Control(),prog_note=Control(),prog_vehicle_note=Control(),
+        next_action_title=Control(),next_action_detail=Control(),next_action_request=Control(),
+        set_rows=lambda tb,rr:setattr(tb,'rows',rr))
+    return w,sections,account
+def refresh(w):
+    n['coordinate'](w,True)
+    return w.next_action_title.text
+with tempfile.TemporaryDirectory() as tmp:
+    root=pathlib.Path(tmp)
+    w,sections,account=coordinator(root,['17'],{'1','2','17','18'})
+    assert refresh(w)=='Review purchase of Tank 18',w.next_action_title.text
+    assert w.prog_finance_target['id']=='18'
+    w.model.account['credits']=0
+    assert refresh(w)=='Earn credits'
+    assert 'Tank 18' in w.next_action_detail.text
+    w.model.account['credits']=1000
+    sections['account_extra']['free_vehicle_slots']=0
+    assert refresh(w)=='Free a garage slot'
+    assert 'Tank 18' in w.next_action_detail.text
+    sections['account_extra']['free_vehicle_slots']=3
+    w.model.garage.append(tank('18'))
+    w.model.selected={'tank_id':18,'combat_xp':0}
+    sections['research']['unlocked_item_ids']+=[201]
+    assert refresh(w)=='Play Tank 18',w.next_action_title.text
+    assert w.prog_finance_target['id']=='34'
+    w.model.selected['combat_xp']=20
+    assert refresh(w)=='Research Tank 34',w.next_action_title.text
+    sections['research']['unlocked_item_ids']+=[34]
+    assert refresh(w)=='Review purchase of Tank 34'
+    for sty in n['WEIGHTS']:
+        if sty=='Artillery Support': continue
+        w.settings.values['playstyle']=sty
+        refresh(w)
+        assert w.prog_discovery.text==''
+    saved=json.loads((root/'progression'/'careers.json').read_text())
+    assert len(saved['accounts'][account]['careers'])==9
+    w.settings.values['playstyle']=style
+    assert refresh(w)=='Review purchase of Tank 34'
+    assert w.prog_finance_target['id']=='34'
+    w.model.sources['diagnostics']['session']='stale'
+    assert refresh(w)=='Waiting for live garage data'
+with tempfile.TemporaryDirectory() as tmp:
+    w,sections,_=coordinator(pathlib.Path(tmp),['17'],{'1','2','17'})
+    assert refresh(w)=='Review purchase of Tank 2',w.next_action_title.text
+    assert w.prog_finance_target['id']=='2'
+print('PASS: coordinator purchase, named saving, slots, progression, research, playstyle persistence, stale-data gate')
