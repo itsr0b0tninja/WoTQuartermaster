@@ -1,0 +1,52 @@
+name: Verify and publish WoTQuartermaster 0.6.1 Progression
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/progression-0.6.1-release.yml'
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: module-manifest-publication
+  cancel-in-progress: false
+jobs:
+  progression:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Verify progression and module compatibility
+        run: |
+          python .github/scripts/test_progression_0_6_1.py
+          if ($LASTEXITCODE -ne 0) { throw 'Progression regression failed' }
+          python .github/scripts/publish_progression_0_1_1.py
+          if ($LASTEXITCODE -ne 0) { throw 'Module validation failed' }
+      - name: Verify actual desktop UI and module activation
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python -m pip install --disable-pip-version-check PySide6==6.8.3 Pillow==11.3.0
+          if ($LASTEXITCODE -ne 0) { throw 'UI dependencies failed' }
+          python -c "import sys,json; sys.path.insert(0,'.github/scripts'); import publish_0_6_0 as p; p.CORE_SHA=json.load(open('components.json'))['components']['desktop']['sha256']; p.VERSIONS['progression']='0.1.1'; p.ui()"
+          if ($LASTEXITCODE -ne 0) { throw 'Desktop UI regression failed' }
+      - name: Publish verified independent module
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          git fetch origin main
+          test "$(git rev-parse origin/main)" = "$GITHUB_SHA"
+          git checkout -B main origin/main
+          python .github/scripts/publish_progression_0_1_1.py --publish
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add components.json
+          if ! git diff --cached --quiet; then
+            git commit -m "Publish verified WoTQuartermaster 0.6.1 Progression module"
+            git push origin main
+          fi

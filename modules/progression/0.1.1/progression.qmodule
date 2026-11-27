@@ -1,0 +1,539 @@
+# WoTQuartermaster Progression Advisor 0.1.1 - read-only, portable.
+import math, statistics, json, os, re, time, hashlib, logging
+from pathlib import Path
+from bisect import bisect_left,bisect_right
+from module_shared import obj, seq, key, name
+MODULE={'id':'progression','version':'0.1.1','api':1,'min_core':'0.6.0','dependencies':{'research':'0.1.1','finance':'0.1.1','battle_performance':'0.1.3'}}
+WEIGHTS={'Passive Scout':(35,40,15,0,0,5,5),'Active Scout':(30,25,35,0,0,5,5),'Hybrid Scout':(25,25,25,15,5,5,0),'Combat Scout':(20,15,25,25,10,5,0),'Flanker':(5,10,35,25,20,5,0),'Fire Support':(5,5,10,35,30,10,5),'Concealed Sniper':(5,30,5,25,30,0,5),'Brawler':(0,0,10,30,15,40,5),'Defensive Fighter':(5,5,5,25,15,30,15),'Artillery Support':(0,5,10,40,35,0,10)}
+CATEGORIES=('Reconnaissance','Concealment','Mobility','Firepower','Gun handling','Protection','Flexibility')
+MODES=('random_pvp','ai_or_mixed')
+NATIONS=('USSR','Germany','USA','China','France','UK','Japan','Czechoslovakia','Sweden','Poland','Italy')
+FORMULA=2
+def number(x):
+    return x if type(x) in (int,float) and math.isfinite(x) else None
+def nonneg(x):
+    v=number(x); return v if v is not None and v>=0 else None
+def one(x):
+    # Do not average distinct operating modes. First reported normal mode, if valid.
+    return number(x[0]) if isinstance(x,list) and x else number(x)
+def at(x,i):
+    return number(x[i]) if isinstance(x,list) and len(x)>i else None
+def neg(x): return -x if x is not None else None
+def cash(x):
+    if not isinstance(x,dict): return None
+    if any(number(v) not in (None,0) for k,v in x.items() if k!='credits'): return None
+    return nonneg(x.get('credits'))
+def fmt(x):
+    return 'Unknown' if x is None else f'{x:,.0f}' if type(x) in (int,float) else str(x)
+def title(rows,k): return name(obj(rows.get(k)), 'Vehicle '+str(k))
+def tier(v): return int(v['level']) if type(v.get('level')) is int else 0
+def artillery(v): return str(v.get('type','')).lower()=='spg'
+def regular(v):
+    return 1<=tier(v)<=11 and str(v.get('type','')).lower() in ('lighttank','mediumtank','heavytank','at-spg','spg') and all(v.get(k) is False for k in ('isPremium','isSecret','isCollectible'))
+def edges(v):
+    return [(str(e[1]),e[0],tuple(str(p) for p in e[2:])) for e in seq(v.get('research_edges')) if isinstance(e,list) and len(e)>=2 and nonneg(e[0]) is not None]
+def graph(rows):
+    eligible={k for k,v in rows.items() if regular(v)}
+    out={k:sorted({t for t,_,_ in edges(rows[k]) if t in eligible and tier(rows[t])>tier(rows[k]) and rows[t].get('nationID')==rows[k].get('nationID')}) for k in eligible}
+    roots=sorted(k for k in eligible if tier(rows[k])==1)
+    seen=set(roots); todo=roots[:]
+    while todo:
+        k=todo.pop()
+        for t in out[k]:
+            if t not in seen: seen.add(t); todo.append(t)
+    return {k:[t for t in out[k] if t in seen] for k in seen}
+def attributes(v,p,shots=None):
+    p=obj(p); camo=obj(p.get('invisibilityStillFactor')); moving=obj(p.get('invisibilityMovingFactor'))
+    return {'view':one(p.get('circularVisionRadius')),'still':number(camo.get('current')),'moving':number(moving.get('current')),'firecamo':number(camo.get('atShot')),
+        'power':one(p.get('enginePowerPerTon')),'speed':at(p.get('speedLimits'),0),'reverse':at(p.get('speedLimits'),1),'traverse':one(p.get('chassisRotationSpeed')),
+        'dpm':one(p.get('avgDamagePerMinute')),'pen':one(p.get('avgPiercingPower')),'alpha':one(p.get('avgDamage')),
+        'accuracy':neg(one(p.get('shotDispersionAngle'))),'aim':neg(one(p.get('aimingTime'))),'velocity':number(obj(shots).get('speed')),
+        'hp':one(p.get('maxHealth')),'hull':at(p.get('hullArmor'),0),'turret':at(p.get('turretArmor'),0),'side':at(p.get('hullArmor'),1),
+        'depression':neg(at(p.get('pitchLimits'),0)),'guntraverse':one(p.get('turretRotationSpeed'))}
+def groups(style):
+    camouflage=(('still',60),('moving',25),('firecamo',15)) if style in ('Passive Scout','Concealed Sniper') else (('still',25),('moving',60),('firecamo',15)) if style in ('Active Scout','Combat Scout','Flanker') else (('still',40),('moving',40),('firecamo',20))
+    # Missing terrain, burst, bloom and firing arc are intentionally not fabricated.
+    return ((('view',100),),camouflage,(('power',30),('speed',25),('terrain',20),('traverse',15),('reverse',10)),(('dpm',35),('pen',35),('alpha',20),('burst',10)),(('accuracy',35),('aim',25),('bloom',25),('velocity',15)),(('hp',35),('hull',35),('turret',20),('side',10)),(('depression',40),('arc',35),('guntraverse',25)))
+def percentile(values,x):
+    if x is None or not values: return None
+    if len(values)==1: return 50.0
+    return max(0,min(100,100*(bisect_left(values,x)+(bisect_right(values,x)-bisect_left(values,x)-1)/2)/(len(values)-1)))
+def category_scores(attrs,ref,style):
+    scores=[]; coverage=[]
+    for group in groups(style):
+        items=[(percentile(ref.get(k,[]),attrs.get(k)),w) for k,w in group]
+        valid=[(s,w) for s,w in items if s is not None]; total=sum(w for s,w in valid)
+        scores.append(sum(s*w for s,w in valid)/total if total>=40 else None); coverage.append(total)
+    w=WEIGHTS[style]; used=sum(a for a,s in zip(w,scores) if s is not None)
+    overall=sum(a*s for a,s in zip(w,scores) if s is not None)/used if used>=75 else None
+    return {'score':overall,'categories':scores,'coverage':sum(a*c for a,c in zip(w,coverage))/100}
+def shot_for(g,gun):
+    shots=seq(g.get(str(gun),{}).get('shots'))
+    return next((s for s in shots if number(obj(s).get('defaultPortion')) is not None and s['defaultPortion']>0.5),None)
+def catalogue_scores(rows,tree,gun_enrich):
+    attrs={k:attributes(v,v.get('stock_parameters'),shot_for(gun_enrich,obj(obj(v.get('stock_modules')).get('gun')).get('compactDescr'))) for k,v in rows.items() if tier(v)>0}
+    ref={}
+    for k in tree:
+        v=rows[k]; group=ref.setdefault((tier(v),artillery(v)),{})
+        for f,x in attrs[k].items():
+            if x is not None: group.setdefault(f,[]).append(x)
+    for group in ref.values():
+        for a in group.values(): a.sort()
+    scores={}
+    for k,a in attrs.items():
+        v=rows[k]; group=ref.get((tier(v),artillery(v)),{})
+        scores[k]={s:category_scores(a,group,s) for s in WEIGHTS if artillery(v)==(s=='Artillery Support')}
+    return scores,ref
+def unlocked_set(g):
+    r=obj(g.section('research'))
+    if not isinstance(r.get('unlocked_item_ids'),list) or not isinstance(r.get('initial_unlocks'),list): return None
+    return set(map(str,r['unlocked_item_ids']+r['initial_unlocks']))
+def live_edges(g):
+    out={}
+    for row in obj(obj(g.section('progression')).get('owned_vehicle_paths')).values():
+        row=obj(row); v=key(row.get('vehicle_id'))
+        for e in seq(row.get('edges')):
+            if isinstance(e,dict) and e.get('target_id') is not None: out[(v,str(e['target_id']))]=e
+    return out
+def dependency_plan(rows,source,target,unlocked,live):
+    # Min-cost alternatives with recursive prerequisites; no duplicate shared module research.
+    by={}
+    for t,x,ps in edges(rows.get(source,{})): by.setdefault(t,[]).append((x,ps))
+    def solve(t,known,stack):
+        if t in known: return []
+        if t in stack: return None
+        plans=[]
+        for cost,ps in by.get(t,[]):
+            planned=[]; seen=set(known); ok=True
+            for p in ps:
+                q=solve(p,seen,stack|{t})
+                if q is None: ok=False; break
+                planned+=q; seen.update(x['id'] for x in q)
+            if not ok: continue
+            e=obj(live.get((source,t))); adjusted=nonneg(obj(e.get('target')).get('blueprint_adjusted_xp'))
+            price=adjusted if adjusted is not None else cost
+            planned.append(dict(id=t,xp=price,source=source,discount_known=adjusted is not None or t not in rows))
+            plans.append(planned)
+        return min(plans,key=lambda q:(sum(x['xp'] for x in q),len(q))) if plans else None
+    return solve(target,set(unlocked),set())
+def price_for(g,rows,k,live=None):
+    e=obj(obj(live).get('target'))
+    for raw in (e.get('personal_discount_price'),e.get('buy'),obj(obj(g.section('current_shop_prices')).get('prices')).get(k),obj(rows.get(k)).get('default_buy')):
+        x=cash(raw)
+        if x is not None: return x
+    return None
+def stock_ids(row):
+    return {str(v['compactDescr']) for v in obj(row.get('stock_modules')).values()
+            if isinstance(v,dict) and v.get('compactDescr') is not None}
+
+def route_candidates(rows,tree,scores,style,owned,unlocked,xps,g,live,crew):
+    # Evaluate each canonical branch from its national root. Entry and fit are
+    # independent: owning a tank never changes the stock suitability of a branch.
+    available=set(owned)|set(unlocked); candidates=[]
+    blocked=set(map(str,seq(obj(g.section('current_shop_prices')).get('vehicles_not_to_buy'))))|set(map(str,seq(obj(g.section('current_shop_prices')).get('hidden_item_ids'))))
+    blocked-=set(owned)
+    def score(k):
+        return obj(obj(scores.get(k)).get(style)).get('score')
+    def walk(path):
+        k=path[-1]
+        if score(k) is not None: yield tuple(path)
+        for t in tree.get(k,[]): yield from walk(path+[t])
+    for root in sorted(k for k in tree if tier(rows[k])==1):
+        for full in walk([root]):
+            accessible=[i for i,k in enumerate(full) if k in available]
+            if not accessible: continue
+            entry=max(accessible)
+            # Keep an owned direct predecessor for credit/crew planning.
+            if entry>0 and full[entry] not in owned and full[entry-1] in owned:
+                entry-=1
+            path=list(full[entry:])
+            if any(k in blocked for k in path): continue
+            dest=full[-1]; end=score(dest)
+            mids=[score(k) for k in full[:-1] if score(k) is not None]
+            mid=statistics.mean(mids) if mids else end
+            known=set(available); xp=0; credits=0; xp_complete=True; credit_complete=True
+            for i,k in enumerate(path):
+                if k not in owned:
+                    v=price_for(g,rows,k,live.get((path[i-1],k)) if i else None)
+                    if v is None: credit_complete=False
+                    else: credits+=v
+                if i:
+                    source=path[i-1]
+                    # Stock items of a simulated future purchase are available
+                    # in that simulation only, not written to live unlocks.
+                    known.update(stock_ids(rows[source]))
+                    plan=dependency_plan(rows,source,k,known,live)
+                    if plan is None:
+                        xp_complete=False; continue
+                    source_xp=nonneg(xps.get(source))
+                    if source in owned and source_xp is None and plan: xp_complete=False
+                    xp+=max(0,sum(e['xp'] for e in plan)-(source_xp or 0))
+                    known.update(e['id'] for e in plan)
+            start=path[0]; progress=100*sum(k in available for k in full)/len(full)
+            roles=seq(obj(rows[start].get('vehicle_type')).get('crewRoles'))
+            matching=[c for c in crew if c.get('nationID')==rows[start].get('nationID') and c.get('isDismissed') is False and (c.get('isInTank') is False or str(c.get('native_vehicle_id'))==start)]
+            used=set()
+            for rr in roles:
+                primary=rr[0] if isinstance(rr,list) and rr else None
+                c=next((c for c in matching if c.get('role')==primary and c.get('invID') is not None and c.get('invID') not in used),None)
+                if c: used.add(c['invID'])
+            reuse=100*len(used)/len(roles) if roles else 0
+            candidates.append(dict(path=path,full_path=list(full),destination=dest,start=start,end=end,mid=mid,progress=progress,xp=xp if xp_complete else None,credits=credits if credit_complete else None,reuse=reuse))
+    # Keep the previously approved branch rank as supporting information.
+    bins={}
+    for r in candidates:
+        b=bins.setdefault(tier(rows[r['destination']]),[[],[]])
+        if r['xp'] is not None: b[0].append(-r['xp'])
+        if r['credits'] is not None: b[1].append(-r['credits'])
+    for b in bins.values():
+        for a in b: a.sort()
+    for r in candidates:
+        b=bins[tier(rows[r['destination']])]
+        xx=percentile(b[0],-r['xp']) if r['xp'] is not None else None
+        cc=percentile(b[1],-r['credits']) if r['credits'] is not None else None
+        grind=statistics.mean([x for x in (xx,cc) if x is not None]) if xx is not None or cc is not None else 50
+        r['rank']=.40*r['end']+.25*r['mid']+.15*r['progress']+.15*grind+.05*r['reuse']
+    return sorted(candidates,key=lambda r:(-r['rank'],-tier(rows[r['destination']]),r['path']))
+
+def select_progression(candidates,prior,owned,unlocked,rows,tree,style):
+    # The active style is chosen by the player. Select a tank for the current
+    # progression stage, not a distant terminal vehicle. Fit is the primary
+    # comparison; the original branch rank is only a tie-break.
+    if not candidates: return None
+    def best(options):
+        return min(options,key=lambda r:(-r['end'],-r['mid'],-r['rank'],r['path'])) if options else None
+    def onward(k):
+        children=set(tree.get(k,[]))
+        options=[r for r in candidates if r['destination'] in children and k in r['full_path']]
+        return best(options)
+    def advance_if_owned(r):
+        seen=set()
+        while r and r['destination'] in owned and r['destination'] not in seen:
+            k=r['destination']; seen.add(k)
+            nxt=onward(k)
+            if not nxt: break
+            r=nxt
+        return r
+    # Persist each style's current objective until reached or no longer valid.
+    # Legacy formula-1 routes were selected by the defective distant-target
+    # ranking and must be revalidated, without deleting other account history.
+    p=obj(prior)
+    if p.get('formula')==FORMULA:
+        dest=p.get('destination')
+        same=[r for r in candidates if r['destination']==dest]
+        if same:
+            previous_path=seq(p.get('full_path'))
+            exact=[r for r in same if r['full_path']==previous_path]
+            return advance_if_owned(best(exact or same))
+    # A new style starts at the highest actually accessible tier for that
+    # vehicle domain, at least tier II so that a root alone is not a career.
+    accessible=(set(owned)|set(unlocked))&set(tree)
+    levels=[tier(rows[k]) for k in accessible if artillery(rows[k])==(style=='Artillery Support')]
+    stage=max(2,max(levels,default=1))
+    level=min({tier(rows[r['destination']]) for r in candidates},key=lambda t:(abs(t-stage),-t))
+    return advance_if_owned(best([r for r in candidates if tier(rows[r['destination']])==level]))
+
+def useful_engine_upgrade(g,rows,current,vehicle,style,known,balance,budget):
+    # Conservative optional upgrade: a verified compatible, researched engine
+    # that improves raw power by at least 10% without adding mass. An owned
+    # depot item costs nothing; paid improvements must leave the full known
+    # next-tank planning balance untouched. No speculative gun/equipment gains.
+    if style not in ('Passive Scout','Active Scout','Hybrid Scout','Combat Scout','Flanker'): return None
+    engines=g.catalogue.category('engines')
+    mounted=key(obj(obj(vehicle.get('modules')).get('engine')).get('intCD'))
+    old=obj(obj(engines.get(mounted)).get('descriptor_fields'))
+    power=nonneg(old.get('power')); weight=nonneg(old.get('weight'))
+    if not power or weight is None: return None
+    depot=obj(g.section('depot')).get('ENGINE')
+    if not isinstance(depot,dict): return None
+    options=[]
+    for k in map(str,seq(obj(rows[current].get('compatible_modules')).get('engines'))):
+        if k==mounted or k not in known: continue
+        new=obj(obj(engines.get(k)).get('descriptor_fields'))
+        p=nonneg(new.get('power')); w=nonneg(new.get('weight'))
+        if p is None or w is None or p<power*1.10 or w>weight: continue
+        count=nonneg(depot.get(k,0))
+        if count is None: continue
+        cost=0 if count>0 else price_for(g,engines,k)
+        if cost is None or (cost>0 and (budget is None or balance is None or balance-cost<budget)): continue
+        options.append((p,-cost,k,cost))
+    if not options: return None
+    p,_,k,cost=max(options)
+    return dict(id=k,name=title(engines,k),cost=cost,gain=100*(p/power-1))
+
+def xp_profile(rows,account,vehicle,mode,style,premium):
+    valid=[r for r in rows if r.get('account')==account and r.get('eligible') and r.get('vehicle')==vehicle and r.get('mode')==mode and r.get('at') is not None and nonneg(obj(r.get('personal')).get('originalXP')) is not None]
+    specific=[r for r in valid if r.get('style')==style]
+    valid=specific if len(specific)>=5 else valid
+    valid=sorted(valid,key=lambda r:r['at'],reverse=True)[:50]
+    values=[obj(r['personal'])['originalXP'] for r in valid]
+    if premium: values=[math.floor(x*1.5+.5) for x in values]
+    return {'n':len(values),'average':statistics.mean(values) if len(values)>=5 else None,'scope':'playstyle' if len(specific)>=5 else 'vehicle fallback'}
+def grind(xp,balance,total,xrate,crate,other_rate=None):
+    # Signed cash earnings; research and credit acquisition overlap only on same vehicle.
+    xb=0 if xp==0 else math.ceil(xp/xrate) if xp is not None and xrate is not None and xrate>0 else None
+    gap=max(0,total-balance) if total is not None and balance is not None else None
+    if xb is None or gap is None: return dict(xp_battles=xb,remaining=None,stay=None,switch=None)
+    if crate is None and xb>0: return dict(xp_battles=xb,remaining=None,stay=None,switch=None)
+    remaining=max(0,total-(balance+xb*(crate or 0)))
+    stay=xb if remaining==0 else xb+math.ceil(remaining/crate) if crate is not None and crate>0 else None
+    switch=xb if remaining==0 else xb+math.ceil(remaining/other_rate) if other_rate is not None and other_rate>0 else None
+    return dict(xp_battles=xb,remaining=remaining,stay=stay,switch=switch)
+def quote(g,rows,target,source,owned,finance_profiles,live):
+    # Gross stocking estimate uses full standard load; actual included supplies are unverified.
+    v=rows[target]; e=live.get((source,target)); purchase=0 if target in owned else price_for(g,rows,target,e)
+    gun=key(obj(obj(v.get('stock_modules')).get('gun')).get('compactDescr'))
+    cap=nonneg(g.catalogue.item('vehicles',target,True).get('ammo_capacity'))
+    shots=seq(g.catalogue.item('guns',gun,True).get('shots'))
+    standard=next((s for s in shots if number(obj(s).get('defaultPortion')) is not None and s['defaultPortion']>.5),None)
+    sid=key(obj(standard).get('shell_id')); unit=price_for(g,g.catalogue.category('ammunition'),sid) if sid else None
+    depot=obj(g.section('depot')).get('SHELL')
+    stock=nonneg(depot.get(sid,0)) if isinstance(depot,dict) and sid else None
+    ammo=max(0,cap-stock)*unit if cap is not None and stock is not None and unit is not None else None
+    # Verified reusable crew candidates only; never strip protected vehicles automatically.
+    roles=seq(obj(v.get('vehicle_type')).get('crewRoles')); crew=obj(g.section('crew'))
+    available=[c for c in crew.values() if isinstance(c,dict) and c.get('nationID')==v.get('nationID') and c.get('isDismissed') is False and (c.get('isInTank') is False or str(c.get('native_vehicle_id'))==source)]
+    matches=[]; used=set()
+    for rr in roles:
+        primary=rr[0] if isinstance(rr,list) and rr else None
+        c=next((c for c in available if c.get('role')==primary and c.get('invID') not in used),None)
+        if c: used.add(c.get('invID')); matches.append(c.get('fullUserName') or str(c.get('invID')))
+    # Use observed comparable same-tier reserves only as provisional estimate.
+    direct=next((p['profile'].get('reserve') for p in finance_profiles if p['vehicle']==target and p['profile'].get('n',0)>=5),None)
+    peers=[p['profile']['reserve'] for p in finance_profiles if p.get('tier')==tier(v) and p['profile'].get('n',0)>=5 and p['profile'].get('reserve') is not None]
+    reserve=direct if direct is not None else max(peers) if peers else None
+    slots=nonneg(obj(g.section('account_extra')).get('free_vehicle_slots'))
+    lower=sum(x for x in (purchase,ammo,reserve) if x is not None)
+    return dict(purchase=purchase,ammo=ammo,ammo_capacity=cap,ammo_stock=stock,reserve=reserve,reserve_basis='target observed' if direct is not None else 'same-tier provisional' if peers else 'unknown',crew_matches=matches,crew_slots=len(roles),slots=slots,lower=lower,complete=False,planning_total=purchase+ammo+reserve if all(x is not None for x in (purchase,ammo,reserve)) else None)
+def discovery(rows,account,mode,style,owned,scores):
+    # Exploratory signals only, no invented cross-playstyle absolute score.
+    groups={}
+    for r in rows:
+        if r.get('account')==account and r.get('mode')==mode and r.get('style')==style and r.get('eligible') and r.get('at') is not None and r.get('vehicle') in owned:
+            groups.setdefault(r['vehicle'],[]).append(r)
+    for vid,rr in sorted(groups.items()):
+        rr=sorted(rr,key=lambda r:r['at'])[-50:]
+        if len(rr)<20: continue
+        stats=[obj(r.get('stats')) for r in rr]
+        good=[s for s in stats if all(nonneg(s.get(k)) is not None for k in ('damage','radio','life_fraction'))]
+        if len(good)<20: continue
+        damage=statistics.mean(s['damage'] for s in good); radio=statistics.mean(s['radio'] for s in good); life=statistics.mean(s['life_fraction'] for s in good)
+        if style in ('Passive Scout','Active Scout','Hybrid Scout') and damage>max(1,radio)*1.5 and life>=.5:
+            alternatives=[s for s in ('Combat Scout','Flanker','Fire Support') if s!=style]
+            options=[(obj(obj(scores.get(k)).get(s)).get('score'),s,k) for s in alternatives for k in owned]
+            options=[x for x in options if x[0] is not None and x[0]>=65]
+            if options:
+                _,s,k=max(options)
+                return {'style':s,'vehicle':k,'n':len(good),'reason':'Damage contribution exceeded radio assistance; survival was sustained. This is a trial suggestion, not proof of flanking or tactical behaviour.'}
+    return None
+def load_state(path):
+    try:
+        x=json.loads(path.read_text(encoding='utf-8')); return x if x.get('schema')==1 and isinstance(x.get('accounts'),dict) else {'schema':1,'accounts':{}}
+    except (OSError,ValueError,AttributeError): return {'schema':1,'accounts':{}}
+def save_state(path,data):
+    path.parent.mkdir(parents=True,exist_ok=True); temp=path.with_suffix('.tmp')
+    temp.write_text(json.dumps(data,sort_keys=True,indent=2),encoding='utf-8'); os.replace(temp,path)
+def identity(m):
+    c=obj(m.sources.get('connector')); ctx=obj(m.sources.get('battle_context')); d=obj(m.sources.get('diagnostics'))
+    a=ctx.get('account_key'); session=c.get('session')
+    return a if session and session==ctx.get('session')==d.get('session') and c.get('game_version')==d.get('game_version') and isinstance(a,str) and re.fullmatch('[0-9a-f]{24}',a) else None
+def ready(v):
+    return v.get('isLocked') is False and v.get('isRented') is not True and bool(obj(obj(v.get('modules')).get('gun')).get('intCD')) and bool(seq(v.get('crew_slots'))) and all(obj(s).get('crew_id') is not None for s in v['crew_slots']) and any((nonneg(obj(s).get('count')) or 0)>0 for s in seq(v.get('shells_layout')))
+def current_score(rows,ref,g,vehicle,style):
+    v=g.vehicles.get(str(vehicle.get('invID')),{})
+    cd=key(v.get('intCD'))
+    cfg=obj(obj(g.section('configured_performance')).get(key(v.get('invID'))))
+    if cd not in rows or key(cfg.get('vehicle_id'))!=cd or artillery(rows[cd])!=(style=='Artillery Support'): return None
+    shot=shot_for(g.catalogue.category('guns',True),obj(obj(v.get('modules')).get('gun')).get('intCD'))
+    a=attributes(rows[cd],cfg.get('parameters'),shot)
+    return category_scores(a,ref.get((tier(rows[cd]),artillery(rows[cd])),{}),style)['score']
+def action(w,title_text,detail,intent=None):
+    w.next_action_title.setText(title_text); w.next_action_detail.setText(detail); w.finance_battle_intent=intent
+def reset(w):
+    w.prog_stamp=None; w.prog_static=None; w.prog_data=None; w.prog_last=None; w.prog_finance_target=None; w.prog_vehicle_details=[]
+def make_page(w):
+    p,l=page(); heading(l,'Progression','Chosen playstyle • one next action • Free XP remains optional')
+    w.prog_note=label('Waiting for a verified garage snapshot',wrap=True); l.addWidget(w.prog_note)
+    w.prog_tabs=QTabWidget(); l.addWidget(w.prog_tabs,1); w.prog_tables={}
+    for t,h in [('Overview',['Measure','Value']),('Career',['Tier','Vehicle','Status','Natural fit']),('Technology Trees',['Nation','Destination','Start','Rank','Remaining XP estimate','Purchase estimate']),('Vehicles',['Vehicle','Tier','Natural fit','Current fit','Coverage','Status']),('Research',['Vehicle','Target / prerequisite','XP','Status'])]:
+        q,lay=page(); tb=w.data_table(h); w.prog_tables[t]=tb; lay.addWidget(tb,1)
+        if t=='Overview':
+            w.prog_discovery=label('',wrap=True); lay.addWidget(w.prog_discovery)
+            w.prog_dismiss=QPushButton('Dismiss playstyle suggestion'); w.prog_dismiss.hide(); w.prog_dismiss.clicked.connect(lambda:dismiss(w)); lay.addWidget(w.prog_dismiss)
+        if t=='Vehicles':
+            w.prog_vehicle_note=label('Select a vehicle to view its category scores.',wrap=True); lay.addWidget(w.prog_vehicle_note)
+            tb.currentCellChanged.connect(lambda row,*_:vehicle_detail(w,row))
+        w.prog_tabs.addTab(q,t)
+    reset(w); w.add_page('Progression',p)
+def vehicle_detail(w,row):
+    if 0<=row<len(w.prog_vehicle_details):
+        name_,s=w.prog_vehicle_details[row]
+        w.prog_vehicle_note.setText(name_+' · '+'; '.join(k+': '+fmt(v) for k,v in zip(CATEGORIES,s['categories']))+' · Potential fit: not yet calculated.')
+    else: w.prog_vehicle_note.setText('Select a vehicle to view its category scores.')
+def dismiss(w):
+    if not w.prog_last: return
+    path,data,a,style,suggestion=w.prog_last
+    if suggestion:
+        data['accounts'][a].setdefault('dismissed',{})[style]=suggestion['style']; save_state(path,data)
+        w.prog_stamp=None; w.tick(True)
+def coordinate(w,force=False):
+    m=w.model
+    if not m or not hasattr(w,'prog_tables'): return
+    settings=w.settings.values; style=settings.get('playstyle'); advisor=settings.get('advisor_mode','Full Advisor')
+    if m.state in ('matchmaking','battle_loading','in_battle'): return
+    w.next_action_request.setVisible(advisor=='On Demand')
+    if style=='Profit':
+        # Finance remains the Profit specialist; no progression state is changed.
+        w.prog_finance_target=None; w.prog_stamp=None; w.prog_last=None; w.prog_vehicle_details=[]
+        w.prog_note.setText('Profit has no permanent technology-tree destination. Select a combat playstyle to resume its career.')
+        for t in w.prog_tables.values(): w.set_rows(t,[])
+        w.prog_discovery.setText(''); w.prog_dismiss.hide(); return
+    if style not in WEIGHTS: return
+    a=identity(m); g=m.garage_data
+    if m.state!='garage' or not a or g.status('garage') not in ('ok','empty') or g.status('research') not in ('ok','empty') or not g.catalogue.identity:
+        w.prog_finance_target=None; w.prog_vehicle_details=[]; w.prog_last=None
+        w.prog_note.setText('Waiting for verified live garage, research and catalogue data. Saved careers are retained.')
+        for t in w.prog_tables.values(): w.set_rows(t,[])
+        w.prog_discovery.setText(''); w.prog_dismiss.hide(); w.prog_stamp=None
+        action(w,'Waiting for live garage data','No spending or vehicle-switch advice from an unconfirmed snapshot.'); return
+    rows=g.catalogue.category('vehicles')
+    if not rows:
+        w.prog_finance_target=None; w.prog_stamp=None
+        action(w,'Catalogue unavailable','Wait for the matching complete game catalogue.'); return
+    records=getattr(w,'bp_rows',[])
+    finance=w.runtime.loaded.get('finance'); balance=nonneg(m.account.get('credits'))
+    selected=key(m.selected.get('tank_id')); premium=finance.premium_basis(m,settings.get('strategy')) if finance else False
+    usable=[r for r in records if r.get('account')==a and r.get('mode') in MODES and r.get('eligible') and r.get('at') is not None]
+    mode=max(usable,key=lambda r:r['at'])['mode'] if usable else 'random_pvp'
+    stamp=(str(m.root),a,g.catalogue.identity,m.garage_signature,id(records),style,selected,balance,m.account.get('free_xp'),m.account.get('premium_expiry'),premium,advisor,bool(getattr(w,'finance_requested',False)))
+    if stamp==w.prog_stamp and not force: return
+    w.prog_stamp=stamp
+    if w.prog_static is None or w.prog_static[0]!=g.catalogue.identity:
+        tree=graph(rows); scores,refs=catalogue_scores(rows,tree,g.catalogue.category('guns',True)); w.prog_static=(g.catalogue.identity,tree,scores,refs)
+    _,tree,scores,refs=w.prog_static
+    known=unlocked_set(g)
+    if known is None: action(w,'Waiting for research data','Unlocks are not confirmed.'); return
+    owned={key(v.get('intCD')):v for v in m.garage if key(v.get('intCD')) in rows}
+    known.update(owned); xps={str(k):v for k,v in obj(obj(g.section('research')).get('vehicle_xp')).items()}
+    for k,v in owned.items():
+        if nonneg(v.get('combat_xp')) is not None: xps[k]=v['combat_xp']
+    if selected in owned and nonneg(m.selected.get('combat_xp')) is not None: xps[selected]=m.selected['combat_xp']
+    live=live_edges(g); crew=list(obj(g.section('crew')).values())
+    path=m.root/'progression'/'careers.json'; data=load_state(path); state=data['accounts'].setdefault(a,{'careers':{},'dismissed':{}}); careers=state.setdefault('careers',{})
+    candidates=route_candidates(rows,tree,scores,style,owned,known,xps,g,live,[c for c in crew if isinstance(c,dict)])
+    route=select_progression(candidates,careers.get(style),owned,known,rows,tree,style)
+    if not route:
+        w.prog_finance_target=None; w.prog_last=None; w.prog_vehicle_details=[]
+        w.prog_discovery.setText(''); w.prog_dismiss.hide();
+        for t in w.prog_tables.values(): w.set_rows(t,[])
+        w.prog_note.setText('No verified suitable research route found. Other owned vehicles remain available.')
+        action(w,'Review available vehicles','No confirmed progression option for '+style+'.'); return
+    # Reassess using account-wide unlocks; advance to deepest owned stage on route.
+    route_path=route['path']; pos=max((i for i,k in enumerate(route_path) if k in owned),default=-1)
+    current=route_path[pos] if pos>=0 else None
+    target=route_path[pos+1] if pos+1<len(route_path) else None
+    old=careers.get(style); new={'path':route_path,'full_path':route['full_path'],'destination':route['destination'],'current':current,'next':target,'formula':FORMULA}
+    if old!=new:
+        careers[style]=new
+        try: save_state(path,data)
+        except OSError: logging.exception('Career state could not be saved')
+    profiles=finance.profiles([finance.finance_row(r) for r in usable],m.garage,mode,'Profit',premium) if finance else []
+    # Use intended role for the career tank; alternative credit profiles retain their observed role.
+    career_profiles=finance.profiles([finance.finance_row(r) for r in usable],m.garage,mode,style,premium) if finance else []
+    prof=next((p['profile'] for p in career_profiles if p['vehicle']==current),{})
+    xp_prof=xp_profile(usable,a,current,mode,style,premium) if current else {}
+    xp_rate=xp_prof.get('average'); credit_rate=prof.get('average') if prof.get('n',0)>=5 else None
+    plan=dependency_plan(rows,current,target,known,live) if current and target else [] if target in known else None
+    cost=sum(p['xp'] for p in plan) if plan is not None else None
+    available_xp=nonneg(xps.get(current)) if current else 0
+    if cost==0: gap=0
+    else: gap=max(0,cost-available_xp) if cost is not None and available_xp is not None else None
+    q=quote(g,rows,target,current,owned,profiles,live) if target else None
+    w.prog_finance_target=dict(id=target,name=title(rows,target),price=q['purchase'],unlocked=target in known,source=current,planning_total=q['planning_total'],ammo=q['ammo'],reserve=q['reserve'],account=a) if q else None
+    total=q['planning_total'] if q else None
+    best,reason=finance.choose(profiles,selected,style) if finance else (None,'')
+    if best and (not best.get('ready') or best['profile'].get('n',0)<5 or best['profile'].get('average',0)<=0): best=None
+    other=best['profile']['average'] if best else None
+    gr=grind(gap,balance,total,xp_rate,credit_rate,other)
+    free=nonneg(m.account.get('free_xp')); shortcut=min(free,gap) if free is not None and gap is not None else None
+    alt=grind(gap-shortcut,balance,total,xp_rate,credit_rate,other) if shortcut is not None else {}
+    def estimate(z):
+        n=[z.get(k) for k in ('stay','switch') if z.get(k) is not None]; return min(n) if n else None
+    norm=estimate(gr); fast=estimate(alt)
+    optional='None needed'
+    if shortcut:
+        xp_saved=gr['xp_battles']-alt['xp_battles'] if gr['xp_battles'] is not None and alt.get('xp_battles') is not None else None
+        optional=f'Optional {fmt(shortcut)} Free XP; '+(f'{fmt(norm-fast)} combined battles saved (estimate)' if norm is not None and fast is not None else f'{fmt(xp_saved)} research battles saved; credit requirement may still apply' if xp_saved is not None else 'battle saving not yet known')
+    target_name=title(rows,target) if target else 'No further verified tier'
+    current_name=title(rows,current) if current else 'Not yet owned'
+    details=[('Selected playstyle',style),('Current vehicle',current_name),('Current progression objective',title(rows,route['destination'])),('Next vehicle',target_name),('Outstanding combat XP',fmt(gap)),('Vehicle XP available',fmt(available_xp)),('XP per battle',fmt(xp_rate)),('Net credits / battle',fmt(credit_rate)),('Mode / strategy',mode+' / '+settings.get('strategy','')),('Estimated research battles',fmt(gr['xp_battles'])),('Stay in career tank (partial budget)',fmt(gr['stay'])),('Switch to credit earner (partial budget)',fmt(gr['switch'])),('Combined battles (partial budget)',fmt(norm)),('Free XP alternative',optional)]
+    if q:
+        details += [('Vehicle purchase',fmt(q['purchase'])),('Initial standard ammo estimate (depot deducted)',fmt(q['ammo'])),('Operating reserve',fmt(q['reserve'])+' · '+q['reserve_basis']),('Known/estimated subtotal (incomplete)',fmt(q['lower'])),('Unpriced preparation','Included supplies, consumables, crew retraining, modules/equipment, garage slot if required'),('Potential crew reuse',', '.join(q['crew_matches']) or 'None confirmed'),('Crew positions',fmt(q['crew_slots'])),('Free garage slots',fmt(q['slots']))]
+    protected={k for c in careers.values() if isinstance(c,dict) for k in seq(c.get('path'))}
+    earners={p['vehicle'] for p in profiles if p['profile'].get('n',0)>=5 and (p['profile'].get('average') or 0)>0}
+    sale=[k for k,v in owned.items() if k not in protected|earners and v.get('isPremium') is False and v.get('isElite') is True and regular(rows[k])]
+    if q and (q['slots']==0 or balance is not None and q['purchase'] is not None and balance<q['purchase']) and sale:
+        details.append(('Optional retention review',', '.join(title(rows,k) for k in sale)+' · verify crew/equipment and future usefulness before sale'))
+    w.set_rows(w.prog_tables['Overview'],details)
+    w.set_rows(w.prog_tables['Career'],[(tier(rows[k]),title(rows,k),'Owned' if k in owned else 'Researched' if k in known else 'Future',fmt(obj(obj(scores.get(k)).get(style)).get('score'))) for k in route_path])
+    nation_best={}
+    for r in candidates:
+        n=rows[r['destination']].get('nationID')
+        if n not in nation_best: nation_best[n]=r
+    w.set_rows(w.prog_tables['Technology Trees'],[(NATIONS[n] if type(n) is int and 0<=n<len(NATIONS) else str(n),title(rows,r['destination']),title(rows,r['start']),fmt(r['rank']),fmt(r['xp']),fmt(r['credits'])) for n,r in nation_best.items()])
+    listed=set(tree)|set(owned)|{k for k,v in rows.items() if v.get('isCollectible') is True and v.get('isSecret') is False and k in known}
+    vehicle_rows=[]
+    for k in listed:
+        s=obj(obj(scores.get(k)).get(style))
+        if not s or s.get('score') is None: continue
+        v=owned.get(k); cs=current_score(rows,refs,g,v,style) if v else None
+        vehicle_rows.append((s['score'],k,title(rows,k),tier(rows[k]),fmt(s['score']),fmt(cs),fmt(s['coverage'])+'%', 'Owned' if v else 'Researched' if k in known else 'Locked'))
+    ordered=sorted(vehicle_rows,reverse=True)
+    w.prog_vehicle_details=[(r[2],scores[r[1]][style]) for r in ordered]
+    w.set_rows(w.prog_tables['Vehicles'],[r[2:] for r in ordered])
+    vehicle_detail(w,w.prog_tables['Vehicles'].currentRow())
+    modules={k:v for cat in ('guns','turrets','engines','chassis','radios') for k,v in g.catalogue.category(cat).items()}
+    allitems={**modules,**rows}
+    w.set_rows(w.prog_tables['Research'],[(current_name,title(allitems,p['id']),fmt(p['xp']),'Required' if p['id']!=target else 'Next vehicle') for p in (plan or [])])
+    suggestion=None  # Optional playstyle discovery deferred; never influences progression.
+    if suggestion and state.get('dismissed',{}).get(style)==suggestion['style']: suggestion=None
+    w.prog_last=(path,data,a,style,suggestion)
+    w.prog_discovery.setText(('Optional playstyle trial: '+suggestion['style']+' in '+title(rows,suggestion['vehicle'])+'. '+suggestion['reason']) if suggestion else '')
+    w.prog_dismiss.setVisible(bool(suggestion))
+    w.prog_note.setText('Live progression assessment · '+mode+' · Stock scores; current scores where verified. Potential configuration and exact purchase packages pending.')
+    if advisor=='Information Only': action(w,'Information only','Progression information is available without automatic advice.'); return
+    if advisor=='On Demand' and not getattr(w,'finance_requested',False): action(w,'Advice on demand','Select Show advice when needed.'); return
+    if not target:
+        if current and not ready(owned[current]): action(w,'Prepare '+current_name,'Check crew, gun and ammunition before battle.')
+        else: action(w,('Play '+current_name) if current else 'Review career','No further verified next-tier vehicle on this route; retain your chosen playstyle.')
+        return
+    if target not in known:
+        # If XP can complete a prerequisite, advise that exact action before playing more.
+        if plan and available_xp is not None and available_xp>=plan[0]['xp']:
+            action(w,'Research '+title(allitems,plan[0]['id']),'Required for '+target_name+'. '+optional); return
+        if current and ready(owned[current]):
+            upgrade_budget=total if q and q.get('complete') else None
+            upgrade=useful_engine_upgrade(g,rows,current,owned[current],style,known,balance,upgrade_budget) if gap is not None and gap>0 and plan is not None else None
+            if upgrade:
+                action(w,'Mount '+upgrade['name'],'On '+current_name+': verified engine power improvement '+fmt(upgrade['gain'])+'%; '+('available in depot' if upgrade['cost']==0 else fmt(upgrade['cost'])+' credits, next-tank planning balance protected')+'. Continue towards '+target_name+'.'); return
+            action(w,('Play ' if selected==current else 'Switch to ')+current_name,fmt(gap)+' XP remaining for '+target_name+'. '+optional)
+        elif current: action(w,'Prepare '+current_name,'Check missing crew, gun and ammunition.')
+        else: action(w,'Review research route','No owned starting vehicle confirmed.')
+        return
+    if q and q['slots']==0:
+        action(w,'Free a garage slot','A garage slot is required for '+target_name+'. Review retention and optional sale candidates on Progression; do not sell a protected vehicle.'); return
+    if q and q['purchase'] is not None and balance is not None:
+        goal=total if total is not None else q['purchase']+(q['ammo'] or 0)+(q['reserve'] or 0)
+        if balance<goal:
+            if best:
+                vid=best['vehicle']; intent=dict(vehicle=vid,style=best['style'],objective=style,purpose='Credit grinding') if selected==vid else None
+                action(w,('Play ' if selected==vid else 'Switch to ')+best['name'],'Earn credits for '+target_name+'; at least '+fmt(goal-balance)+' credits short. Budget incomplete. '+reason,intent)
+            elif current and ready(owned[current]): action(w,'Play '+current_name,'Earn credits for '+target_name+'; at least '+fmt(goal-balance)+' short. No better proven credit earner.')
+            else: action(w,'Earn credits','Save for '+target_name+'; at least '+fmt(goal-balance)+' credits short. Purchase/preparation budget incomplete; no proven ready credit earner.')
+            return
+        action(w,'Review purchase of '+target_name,'Ready to advance if the in-game purchase package and preparation costs fit your balance. Purchase and reported stocking estimates covered; verify outstanding crew, included ammunition, consumables and reserve. Total acquisition cost is not confirmed.'); return
+    action(w,'Review '+target_name,'Research complete; exact purchase affordability is not confirmed.')
+def navigate(w,page_name):
+    if page_name=='Progression': coordinate(w,True)
+def register():
+    return {'services':{'progression_available':lambda context:True},'views':{'coordinate_progression':coordinate},'pages':[{'name':'Progression','order':40,'build':make_page}],'hooks':{'reset':reset}}
