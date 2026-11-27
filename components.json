@@ -18,11 +18,11 @@
       "asset": "WoTQuartermaster.exe",
       "channel": "alpha",
       "min_desktop": "0.2.0",
-      "release": "v0.4.1",
-      "sha256": "9d2fe53e19ced1a99a41e9ad2b3cc6cee0fb7406f612984529be95a779ec515e",
-      "size": 55811132,
-      "url": "https://github.com/itsr0b0tninja/WoTQuartermaster/releases/download/v0.4.1/WoTQuartermaster.exe",
-      "version": "0.4.1"
+      "release": "v0.5.0",
+      "sha256": "3a85c336c1ad41694256fe65c6559d2fbc5e11e8db9571d5719a622d9a7ed4cc",
+      "size": 55813025,
+      "url": "https://github.com/itsr0b0tninja/WoTQuartermaster/releases/download/v0.5.0/WoTQuartermaster.exe",
+      "version": "0.5.0"
     },
     "replay_parser": {
       "asset": "WoT_Quartermaster_Replay_Parser.txt",
@@ -41,13 +41,13 @@
       "asset": "battle_performance.qmodule",
       "channel": "alpha",
       "dependencies": {},
-      "min_core": "0.4.1",
-      "release": "battle_performance-v0.1.1",
+      "min_core": "0.5.0",
+      "release": "battle_performance-v0.1.2",
       "required": true,
-      "sha256": "e22f66322efea14a42bb9f11729c4f085d53671fc4e6851d8a421c8bdb926441",
-      "size": 38749,
-      "url": "https://github.com/itsr0b0tninja/WoTQuartermaster/releases/download/battle_performance-v0.1.1/battle_performance.qmodule",
-      "version": "0.1.1"
+      "sha256": "8660ecf8acaf445281774126605a0aa6386de9acfee37246ea43150435873fbb",
+      "size": 40652,
+      "url": "https://github.com/itsr0b0tninja/WoTQuartermaster/releases/download/battle_performance-v0.1.2/battle_performance.qmodule",
+      "version": "0.1.2"
     },
     "crew": {
       "api": 1,
@@ -60,6 +60,21 @@
       "sha256": "66e7aa578c00d45a3065fec60e50f2c4146bfda46352af5eb66757603ff8037c",
       "size": 4392,
       "url": "https://github.com/itsr0b0tninja/WoTQuartermaster/releases/download/crew-v0.1.0/crew.qmodule",
+      "version": "0.1.0"
+    },
+    "finance": {
+      "api": 1,
+      "asset": "finance.qmodule",
+      "channel": "alpha",
+      "dependencies": {
+        "battle_performance": "0.1.2"
+      },
+      "min_core": "0.5.0",
+      "release": "finance-v0.1.0",
+      "required": true,
+      "sha256": "458f03b0951d9b19664ea5c1a6180b800b650298227240c690abf25b2b3c6f1f",
+      "size": 24652,
+      "url": "https://github.com/itsr0b0tninja/WoTQuartermaster/releases/download/finance-v0.1.0/finance.qmodule",
       "version": "0.1.0"
     },
     "garage": {
@@ -115,7 +130,7 @@
       "version": "0.1.0"
     }
   },
-  "product_version": "0.4.1",
+  "product_version": "0.5.0",
   "retired_modules": [
     "diagnostic"
   ],
