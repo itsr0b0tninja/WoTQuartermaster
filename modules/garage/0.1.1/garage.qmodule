@@ -1,0 +1,105 @@
+from module_runtime import ModuleUnavailable
+import hashlib, json, logging, time, io
+from pathlib import Path
+from module_shared import obj, seq, key, num, display, money, name
+MODULE={'id':'garage','version':'0.1.1','api':1,'min_core':'0.3.2','dependencies':{}}
+PARAMS=[('Firepower','Average damage','avgDamage',''),('Firepower','Damage per minute','avgDamagePerMinute',''),('Firepower','Average penetration','avgPiercingPower',' mm'),('Firepower','Reload','reloadTimeSecs',' s'),('Firepower','Aim time','aimingTime',' s'),('Firepower','Dispersion','shotDispersionAngle',''),('Survivability','Hit points','maxHealth',' HP'),('Survivability','Hull armour','hullArmor',' mm'),('Survivability','Turret armour','turretArmor',' mm'),('Mobility','Engine power','enginePower',' hp'),('Mobility','Power / weight','enginePowerPerTon',' hp/t'),('Mobility','Top speed','speedLimit',' km/h'),('Mobility','Reverse speed','rearSpeedLimit',' km/h'),('Mobility','Hull traverse','chassisRotationSpeed',' °/s'),('Spotting','View range','circularVisionRadius',' m'),('Spotting','Radio range','radioDistance',' m'),('Concealment','Stationary concealment','invisibilityStillFactor',' %'),('Concealment','Moving concealment','invisibilityMovingFactor',' %')]
+def parameter(p,k,unit):
+    v=obj(p).get(k)
+    if k.startswith('invisibility'): v=obj(v).get('current')
+    if v is None: return 'Unknown'
+    if isinstance(v,list) and len(v)==1: v=v[0]
+    return display(v)+unit
+
+
+def performance(self,v):
+    static=self.catalogue.item('vehicles',v.get('intCD'))
+    current=obj(obj(self.section('configured_performance')).get(key(v.get('invID'))))
+    if key(current.get('vehicle_id'))!=key(v.get('intCD')) or any(key(i)!=key(obj(obj(v.get('modules')).get(k)).get('intCD')) for k,i in obj(current.get('modules')).items()): current={}
+    return obj(static.get('stock_parameters')),obj(current.get('parameters'))
+
+def overview(self,v):
+    stock,current=self.performance(v)
+    rows=[(group,title,parameter(stock,k,u),parameter(current,k,u)) for group,title,k,u in PARAMS]
+    return [('Vehicle','Combat XP','—',display(v.get('combat_xp'))),('Vehicle','Purchase price','—',money(v.get('purchase_price'))),('Vehicle','Resale value','—',money(v.get('resale_price'))),('Vehicle','Personal discount price','—',money(v.get('personal_discount_price')))]+rows
+
+def make_garage(self):
+    w,l=page(); heading(l,'Garage','Garage module v'+MODULE['version']+' · Read-only configuration · no purchases or crew changes are performed')
+    self.garage_note=label('Waiting for garage data','Subheading',True); l.addWidget(self.garage_note)
+    self.follow_vehicle=QCheckBox('Follow selected in-game vehicle'); self.follow_vehicle.setChecked(self.settings.flag('follow_vehicle')); self.follow_vehicle.toggled.connect(self.change_follow_vehicle); l.addWidget(self.follow_vehicle)
+    split=QSplitter(); self.vehicle_list=QListWidget(); self.vehicle_list.setMinimumWidth(140); self.vehicle_list.currentItemChanged.connect(self.garage_pick); split.addWidget(self.vehicle_list)
+    right=QWidget(); rr=QVBoxLayout(right); self.garage_title=label('No vehicle selected','Heading',True); rr.addWidget(self.garage_title)
+    self.garage_detail_note=label('','Subheading',True); rr.addWidget(self.garage_detail_note)
+    self.vehicle_tabs=QTabWidget(); self.vehicle_tables={}
+    self.vehicle_specs={t['title']:t for t in self.runtime.tab_specs('vehicle')}
+    for title,spec in self.vehicle_specs.items():
+        t=self.data_table(spec['headers']); self.vehicle_tables[title]=t; self.vehicle_tabs.addTab(t,title)
+    self.vehicle_tabs.currentChanged.connect(lambda i:self.render_vehicle(True))
+    rr.addWidget(self.vehicle_tabs,1); split.addWidget(right); split.setStretchFactor(1,1); split.setSizes([180,730]); l.addWidget(split,1)
+    self.garage_view_stamp=None; self.vehicle_view_stamp=None; self.depot_view_stamp=None; self.research_view_stamp=None; self.garage_key=None
+    self.add_page('Garage',w)
+
+def change_follow_vehicle(self,checked):
+    self.settings.values['follow_vehicle']='yes' if checked else 'no'
+    try: self.settings.save()
+    except OSError: logging.exception('Could not save follow preference')
+    self.refresh_garage_views(True)
+
+def garage_pick(self,current,previous):
+    if current is None: return
+    self.garage_key=current.data(Qt.ItemDataRole.UserRole)
+    if self.follow_vehicle.isChecked(): self.follow_vehicle.setChecked(False)
+    self.render_vehicle(True)
+
+def refresh_garage_views(self,force=False):
+    if not self.model or not hasattr(self,'vehicle_list'): return
+    m=self.model; g=m.garage_data
+    active=m.selected.get('tank_id')
+    if self.follow_vehicle.isChecked():
+        candidates=g.by_type.get(str(active),[])
+        selected=candidates[0] if len(candidates)==1 else None
+    else:
+        selected=self.garage_key if self.garage_key in g.vehicles else None
+    stamp=(m.garage_signature,tuple(g.vehicles),selected)
+    if force or stamp!=self.garage_view_stamp:
+        self.garage_view_stamp=stamp; self.vehicle_list.blockSignals(True)
+        try:
+            self.vehicle_list.clear(); pick=None
+            for inv,v in sorted(g.vehicles.items(),key=lambda x:(str(x[1].get('userName','')).casefold(),x[0])):
+                item=QListWidgetItem(str(v.get('userName') or v.get('name') or inv)+'\nTier '+str(v.get('level','?')))
+                item.setData(Qt.ItemDataRole.UserRole,inv); self.vehicle_list.addItem(item)
+                if inv==selected: pick=item
+            if pick: self.vehicle_list.setCurrentItem(pick)
+            self.garage_key=selected
+        finally: self.vehicle_list.blockSignals(False)
+    state='Live snapshot' if m.state in ('garage','matchmaking','battle_loading','in_battle') and m.disk.get('diagnostics') else 'Saved / offline snapshot'
+    self.garage_note.setText(f'{len(g.vehicles)} owned vehicles · {state} · {fmt_time(g.diag.get("sampled_at"))}' if g.diag else 'No matching account snapshot')
+    if self.stack.currentWidget()==self.pages['Garage']: self.render_vehicle(force)
+
+def render_vehicle(self,force=False):
+    if not self.model or not hasattr(self,'vehicle_tables'): return
+    g=self.model.garage_data; v=g.vehicles.get(self.garage_key); i=self.vehicle_tabs.currentIndex()
+    if i<0: return
+    tab=self.vehicle_tabs.tabText(i); table=self.vehicle_tables[tab]
+    stamp=(self.model.garage_signature,g.catalogue.identity,self.garage_key,tab)
+    if not force and stamp==self.vehicle_view_stamp: return
+    self.vehicle_view_stamp=stamp
+    if not v:
+        self.garage_title.setText('No vehicle selected'); self.garage_detail_note.setText('Select a vehicle manually or select one in the game.'); self.set_rows(table,[]); return
+    self.garage_title.setText(str(v.get('userName') or v.get('name') or 'Vehicle')+' · Tier '+str(v.get('level','?')))
+    spec=self.vehicle_specs[tab]
+    note=spec.get('note','')
+    if tab=='Ammo': note='Capacity: '+display(v.get('ammo_capacity'))+' · '+note
+    try:
+        rows=g.runtime.invoke_service(g,spec['service'],v); self.set_rows(table,rows)
+        warning=' · Catalogue data unavailable / partial' if g.catalogue.errors else ''
+        self.garage_detail_note.setText(note+warning+(' · No rows reported' if not rows else ''))
+    except Exception as exc:
+        logging.exception('Garage detail error'); self.set_rows(table,[]); self.garage_detail_note.setText('Data unavailable: '+str(exc))
+
+
+def reset_view(self):
+    self.garage_view_stamp=None; self.vehicle_view_stamp=None; self.garage_key=None
+
+def register():
+    return {'services':{"performance":performance,"overview":overview},'views':{"make_garage":make_garage,"change_follow_vehicle":change_follow_vehicle,"garage_pick":garage_pick,"refresh_garage_views":refresh_garage_views,"render_vehicle":render_vehicle},'pages':[{'name':"Garage",'order':20,'build':make_garage}],'tabs':[{ 'group':'vehicle','title':"Overview",'order':10,'headers':["Category","Parameter","Stock","Current snapshot"],'service':'overview','note':"Stock and actual configured statistics; hypothetical configurations deferred." }],'hooks':{'refresh':refresh_garage_views,'reset':reset_view},'factories':{}}
