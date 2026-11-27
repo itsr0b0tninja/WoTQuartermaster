@@ -126,12 +126,12 @@
         "research": "0.1.1"
       },
       "min_core": "0.6.0",
-      "release": "progression-v0.1.0",
+      "release": "progression-v0.1.1",
       "required": true,
-      "sha256": "2d952c3f4bc04b7ac24aa161d623dab14ea9b245e1cfeb3b551ea81a75372188",
-      "size": 37079,
-      "url": "https://github.com/itsr0b0tninja/WoTQuartermaster/releases/download/progression-v0.1.0/progression.qmodule",
-      "version": "0.1.0"
+      "sha256": "8d1b40b68a9ee76c0597c795ac824e48071d2ddceff1eee091ba0b3b9dd08cd5",
+      "size": 42056,
+      "url": "https://github.com/itsr0b0tninja/WoTQuartermaster/releases/download/progression-v0.1.1/progression.qmodule",
+      "version": "0.1.1"
     },
     "research": {
       "api": 1,
@@ -147,7 +147,7 @@
       "version": "0.1.1"
     }
   },
-  "product_version": "0.6.0",
+  "product_version": "0.6.1",
   "retired_modules": [
     "diagnostic"
   ],
