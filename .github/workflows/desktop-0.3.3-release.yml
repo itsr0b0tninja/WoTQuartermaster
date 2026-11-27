@@ -1,0 +1,131 @@
+name: Build WoTQuartermaster desktop 0.3.3
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/desktop-0.3.3-release.yml'
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: desktop-release-0.3.3
+  cancel-in-progress: false
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          architecture: x64
+      - name: Install build dependencies
+        run: python -m pip install --disable-pip-version-check PySide6==6.8.3 Pillow==11.3.0 PyInstaller==6.14.2
+      - name: Syntax and updater safety checks
+        shell: pwsh
+        run: |
+          $actual = (git hash-object desktop/WoTQuartermaster_v0.3.3.txt).Trim()
+          if ($actual -ne 'bf2c8e9d9c655d8b5ee2da1cc763a290f379e94e') { throw 'Source hash mismatch' }
+          if ((git hash-object desktop/module_runtime.py).Trim() -ne 'd216c6315375480489e41564c15609b29e10f60a') { throw 'Runtime source hash mismatch' }
+          if ((git hash-object desktop/module_shared.py).Trim() -ne 'e952fca5b3c8201f8681d2aebe34252a1d8c62e5') { throw 'Shared source hash mismatch' }
+          python .github/scripts/build_module_index_0_3_2.py
+          if ($LASTEXITCODE -ne 0) { throw 'Module index failed' }
+          if ((git hash-object desktop/module_manager.py).Trim() -ne '2b7157d5e139a3a0eda341fbd727ae9a346b79e1') { throw 'Module manager source mismatch' }
+          if ((git hash-object desktop/module_manager_online.py).Trim() -ne 'b285eecef07dbe809440a3d540a684477843dac4') { throw 'Online manager source mismatch' }
+          Copy-Item desktop/module_manager_online.py module_manager_online.py
+          Copy-Item desktop/module_manager.py module_manager.py
+          Copy-Item desktop/module_runtime.py module_runtime.py
+          Copy-Item desktop/module_shared.py module_shared.py
+          Copy-Item desktop/WoTQuartermaster_v0.3.3.txt WoTQuartermaster.py
+          python -m py_compile WoTQuartermaster.py
+          if ($LASTEXITCODE -ne 0) { throw 'Syntax failed' }
+          python desktop/test_updater_v0.3.3.txt
+          if ($LASTEXITCODE -ne 0) { throw 'Updater safety checks failed' }
+          python desktop/test_modules_v0.3.3.txt
+          if ($LASTEXITCODE -ne 0) { throw 'Module fixture checks failed' }
+          python desktop/test_online_modules_v0.3.3.txt
+          if ($LASTEXITCODE -ne 0) { throw 'Module distribution checks failed' }
+          python WoTQuartermaster.py --check-data "${{ runner.temp }}/quartermaster-empty-test"
+          if ($LASTEXITCODE -ne 0) { throw 'Data check failed' }
+      - name: Compile standalone Windows executable
+        shell: pwsh
+        run: |
+          python -m PyInstaller --noconfirm --clean --onefile --windowed --name WoTQuartermaster --hidden-import PIL.DdsImagePlugin --hidden-import PIL.Image --hidden-import PIL.PngImagePlugin --add-data "desktop/runtime_modules/index.json;runtime_modules" WoTQuartermaster.py
+          if ($LASTEXITCODE -ne 0) { throw 'Build failed' }
+          $file = Get-Item dist/WoTQuartermaster.exe
+          if ($file.Length -lt 100000) { throw 'Executable too small' }
+          $stream = [System.IO.File]::OpenRead($file.FullName)
+          try { if ($stream.ReadByte() -ne 77 -or $stream.ReadByte() -ne 90) { throw 'Invalid PE executable' } } finally { $stream.Dispose() }
+      - name: Smoke test compiled executable
+        shell: pwsh
+        run: |
+          $testDir = Join-Path $env:RUNNER_TEMP 'quartermaster-online-smoke'
+          New-Item -ItemType Directory -Force $testDir | Out-Null
+          Copy-Item dist/WoTQuartermaster.exe $testDir
+          $env:QT_QPA_PLATFORM = 'offscreen'
+          $proc = Start-Process -FilePath (Join-Path $testDir 'WoTQuartermaster.exe') -WorkingDirectory $testDir -PassThru
+          try {
+            $ready = $false
+            for ($i=0; $i -lt 90; $i++) {
+              Start-Sleep -Seconds 1
+              $proc.Refresh()
+              if ($proc.HasExited) { throw "Desktop startup failed: $($proc.ExitCode)" }
+              $state = Join-Path $testDir 'modules/module-state.json'
+              if (Test-Path $state) {
+                $meta = Get-Content $state -Raw | ConvertFrom-Json
+                if ($meta.active -and !$meta.trial -and !$meta.pending) { $ready=$true; break }
+              }
+            }
+            if (!$ready) { Get-Content (Join-Path $testDir 'logs/desktop.log'); throw 'Online bootstrap failed' }
+            if (!(Test-Path (Join-Path $testDir 'data/database/quartermaster.sqlite3'))) { throw 'Database not created' }
+            $files = @(Get-ChildItem (Join-Path $testDir "modules/sets/$($meta.active)") -Filter '*.qmodule')
+            if ($files.Count -ne 5) { throw 'Online module bootstrap failed' }
+            if (@(Get-ChildItem (Join-Path $testDir 'modules') -Filter '*.qmodule').Count -ne 0) { throw 'Unexpected flat bootstrap modules' }
+          } finally {
+            Get-Process WoTQuartermaster -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+          }
+      - name: Real Windows update and reverse replacement
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          New-Item -ItemType Directory -Force prior | Out-Null
+          gh release download v0.3.2 --repo $env:GITHUB_REPOSITORY --pattern WoTQuartermaster.exe --dir prior
+          if ($LASTEXITCODE -ne 0) { throw 'Previous release download failed' }
+          python desktop/test_compiled_update_v0.3.3.txt prior/WoTQuartermaster.exe dist/WoTQuartermaster.exe
+          if ($LASTEXITCODE -ne 0) { throw 'Compiled update cycle failed' }
+      - name: Publish verified desktop release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $exe = 'dist/WoTQuartermaster.exe'
+          $digest = (Get-FileHash $exe -Algorithm SHA256).Hash.ToLowerInvariant()
+          Set-Content -Path dist/WoTQuartermaster.sha256.txt -Value "$digest  WoTQuartermaster.exe" -Encoding ascii
+          gh release view v0.3.3 --repo $env:GITHUB_REPOSITORY 2>$null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create v0.3.3 --repo $env:GITHUB_REPOSITORY --target $env:GITHUB_SHA --title "WoTQuartermaster v0.3.3 Alpha" --prerelease --notes "Complete portable alpha: fresh online bootstrap, migration, independent backups and version holds, recovery, opt-in third-party modules, fresh manifest retrieval, product/core versions and rotating logs. Connector and replay versions unchanged. Fresh installation requires internet." $exe dist/WoTQuartermaster.sha256.txt
+            if ($LASTEXITCODE -ne 0) { throw 'Desktop release failed' }
+          }
+      - name: Publish component manifest after releases exist
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git fetch origin main
+          git checkout -B main origin/main
+          python .github/scripts/build_module_index_0_3_2.py
+          if ($LASTEXITCODE -ne 0) { throw 'Module index failed' }
+          python .github/scripts/publish_components_0_3_3.py
+          if ($LASTEXITCODE -ne 0) { throw 'Manifest generation failed' }
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add components.json
+          git diff --cached --quiet
+          if ($LASTEXITCODE -ne 0) {
+            git commit -m "Publish verified component manifest for desktop 0.3.3"
+            if ($LASTEXITCODE -ne 0) { throw 'Manifest commit failed' }
+            git push origin main
+            if ($LASTEXITCODE -ne 0) { throw 'Manifest publication failed' }
+          }

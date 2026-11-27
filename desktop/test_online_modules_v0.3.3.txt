@@ -1,0 +1,60 @@
+# 0.3.3 online manager fixtures.
+import hashlib, io, json, tempfile, threading, importlib.machinery, importlib.util, base64
+from pathlib import Path
+from unittest.mock import patch
+from module_manager_online import ModuleManager
+from module_manager import ROOT
+cancel=threading.Event()
+def fixture(mid,ver):
+    raw=("MODULE="+repr(dict(id=mid,version=ver,api=1,min_core='0.3.3',dependencies={}))+"\ndef register(): return {}\n").encode()
+    entry=dict(version=ver,api=1,min_core='0.3.3',dependencies={},size=len(raw),sha256=hashlib.sha256(raw).hexdigest(),release=mid+'-v'+ver,asset=mid+'.qmodule',url=ROOT+mid+'-v'+ver+'/'+mid+'.qmodule',channel='alpha',required=True)
+    return entry,raw
+def exercise(base):
+    assets={}
+    def add(mid,v):
+        e,raw=fixture(mid,v); assets[e['url']]=raw; return e
+    opener=lambda url:io.BytesIO(assets[url])
+    a=add('alpha','0.1.0'); b=add('beta','0.1.0')
+    mm=ModuleManager(base); assert not mm.start().ready()
+    assert mm.recover({'alpha':a,'beta':b},[],opener,cancel,lambda n,t:None)
+    def activate():
+        t=ModuleManager(base); r=t.start(); assert r.ready(),r.errors; t.confirm(); return t
+    mm=activate(); assert set(mm.runtime.loaded)=={'alpha','beta'}
+    a2=add('alpha','0.1.1'); b2=add('beta','0.1.1')
+    assert mm.stage(mm.plan({'alpha':a2,'beta':b},[]),opener,cancel)
+    mm=activate(); assert mm.state['backup_entries']['alpha']['version']=='0.1.0'
+    assert mm.stage(mm.plan({'alpha':a2,'beta':b2},[]),opener,cancel)
+    mm=activate(); assert set(mm.state['backup_entries'])=={'alpha','beta'}
+    assert mm.stage_rollback('alpha',opener,cancel,lambda n,t:None)
+    mm=activate(); assert mm.state['holds']==['alpha'] and not mm.state['hold']
+    assert mm.runtime.entries['alpha']['version']=='0.1.0'
+    b3=add('beta','0.1.2')
+    target=mm.plan({'alpha':a2,'beta':b3},[])
+    assert target['alpha']['version']=='0.1.0' and target['beta']['version']=='0.1.2'
+    assert mm.stage(target,opener,cancel); mm=activate()
+    assert mm.state['backup_entries']['alpha']['version']=='0.1.1'
+    assert mm.runtime.entries['beta']['version']=='0.1.2'
+    (mm.third/'local.qmodule').write_text("MODULE={'id':'local','version':'0.1.0','api':1,'min_core':'0.3.3','dependencies':{}}\ndef register(): return {}\n")
+    (mm.third/'alpha.qmodule').write_text("MODULE={'id':'alpha','version':'9.9.9','api':1,'min_core':'0.3.3','dependencies':{}}\ndef register(): return {}\n")
+    mm.load_third_party(mm.runtime); assert 'local' in mm.runtime.loaded and mm.runtime.ready() and 'alpha' in mm.runtime.local_failures
+    mm=ModuleManager(base); assert mm.start().ready() and 'local' not in mm.runtime.loaded
+    mm.save(has_previous=False,previous=None)
+    (mm.generation_path(mm.state['active'])/'beta.qmodule').write_bytes(b'bad')
+    mm=ModuleManager(base); assert not mm.start().ready()
+    assert mm.recover({'alpha':a2,'beta':b3},[],opener,cancel,lambda n,t:None)
+    mm=activate(); assert mm.runtime.ready()
+    assert (mm.third/'local.qmodule').exists()
+    print('Fresh bootstrap, backups, holds, unrelated updates, local module opt-in and repair passed')
+with tempfile.TemporaryDirectory() as tmp: exercise(Path(tmp))
+loader=importlib.machinery.SourceFileLoader('qm','desktop/WoTQuartermaster_v0.3.3.txt')
+spec=importlib.util.spec_from_loader(loader.name,loader); core=importlib.util.module_from_spec(spec); loader.exec_module(core)
+raw=Path('components.json').read_bytes()
+seen=[]
+def fake(url):
+    seen.append(url)
+    if 'raw.githubusercontent.com' in url: raise OSError('raw unavailable')
+    return io.BytesIO(json.dumps({'encoding':'base64','path':'components.json','content':base64.b64encode(raw).decode()}).encode())
+with patch.object(core,'open_url',fake):
+    result=core.fetch_manifest()
+    assert result[0]['desktop']['version'] and len(seen)==2 and '?qm=' in seen[0] and '&qm=' in seen[1]
+print('Manifest cache-busting and API fallback passed')
