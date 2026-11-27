@@ -1,4 +1,4 @@
-name: Build WoTQuartermaster 0.6.2 Progression test
+name: Verify and publish WoTQuartermaster 0.6.2 Progression
 on:
   push:
     branches: [main]
@@ -6,9 +6,13 @@ on:
       - '.github/workflows/progression-0.6.2-test.yml'
       - 'modules/progression/0.1.2/progression.qmodule'
       - '.github/scripts/test_progression_0_6_2.py'
+      - '.github/scripts/publish_progression_0_1_2.py'
   workflow_dispatch:
 permissions:
-  contents: read
+  contents: write
+concurrency:
+  group: module-manifest-publication
+  cancel-in-progress: false
 jobs:
   progression:
     runs-on: windows-latest
@@ -38,3 +42,20 @@ jobs:
           name: progression-0.1.2-test
           path: modules/progression/0.1.2/progression.qmodule
           if-no-files-found: error
+      - name: Publish verified independent module
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          git fetch origin main
+          test "$(git rev-parse origin/main)" = "$GITHUB_SHA"
+          git checkout -B main origin/main
+          python .github/scripts/publish_progression_0_1_2.py --publish
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add components.json
+          if ! git diff --cached --quiet; then
+            git commit -m "Publish verified WoTQuartermaster 0.6.2 Progression module"
+            git push origin main
+          fi
