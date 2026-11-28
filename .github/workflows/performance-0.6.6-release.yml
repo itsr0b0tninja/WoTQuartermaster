@@ -20,7 +20,7 @@ jobs:
         with:
           python-version: '3.12'
           architecture: x64
-      - name: Functional and worker regressions
+      - name: Functional and worker regressions (explicit SQLite test close)
         run: |
           python .github/scripts/test_progression_0_6_6.py
           if ($LASTEXITCODE -ne 0) { throw 'Advisor regression failed' }

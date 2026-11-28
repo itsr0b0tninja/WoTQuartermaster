@@ -43,6 +43,7 @@ def run():
             m.reset_cache();assert m.store.get('connector')=={} and m.store.get('diagnostics')=={}
         finally:release.set();m.close();core.Model._read=original;core.Store.put=old_put
         # Closed worker cannot repopulate reset DB.
-        with sqlite3.connect(root/'database'/'quartermaster.sqlite3') as conn:assert conn.execute('select count(*) from snapshots').fetchone()[0]==0
+        from contextlib import closing
+        with closing(sqlite3.connect(root/'database'/'quartermaster.sqlite3')) as conn:assert conn.execute('select count(*) from snapshots').fetchone()[0]==0
     print('PASS: non-blocking model reads, single flight, SQLite on worker, account isolation, reset drains writer')
 if __name__=='__main__':run()
