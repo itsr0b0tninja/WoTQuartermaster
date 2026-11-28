@@ -1,0 +1,40 @@
+# Run with CPython 2.7.18 only: py -2 Build_WoT_Connector_v0.0.10.txt
+from __future__ import print_function
+import os, sys, tempfile, shutil, py_compile, zipfile, imp
+if sys.version_info[:2] != (2, 7) or imp.get_magic() != b'\x03\xf3\r\n':
+    sys.exit('World of Tanks requires CPython 2.7 bytecode. No package created.')
+base = os.path.dirname(os.path.abspath(__file__))
+source = os.path.join(base, 'WoT_Companion_Connector_v0.0.10_source.txt')
+out = os.path.join(base, 'wot_companion_connector.wotmod')
+work = tempfile.mkdtemp(prefix='wot_connector_', dir=base)
+try:
+    data_dir = os.path.join(base, 'data')
+    if not os.path.isdir(data_dir): os.makedirs(data_dir)
+    with open(source,'rb') as stream:
+        code=stream.read()
+    ini=os.path.join(base,'connector.ini')
+    if not os.path.exists(ini):
+        import io
+        value=data_dir if isinstance(data_dir,unicode) else data_dir.decode(sys.getfilesystemencoding() or 'mbcs')
+        with io.open(ini,'w',encoding='utf-8') as f:
+            f.write(u'[Connector]\ndata_path='+value+u'\n')
+    staged = os.path.join(work, 'mod_wot_companion_connector.py')
+    with open(staged,'wb') as stream:
+        stream.write(code)
+    compiled = os.path.join(work, 'mod_wot_companion_connector.pyc')
+    py_compile.compile(staged, cfile=compiled, dfile='mod_wot_companion_connector.py', doraise=True)
+    with zipfile.ZipFile(out + '.tmp', 'w', zipfile.ZIP_STORED) as archive:
+        archive.write(compiled, 'res/scripts/client/gui/mods/mod_wot_companion_connector.pyc')
+    with zipfile.ZipFile(out + '.tmp', 'r') as archive:
+        if archive.testzip() is not None:
+            raise RuntimeError('Package integrity check failed')
+    if os.path.exists(out):
+        os.remove(out)
+    os.rename(out + '.tmp', out)
+    print('Created: ' + out)
+    print('Configuration: ' + ini)
+    print('Copy both .wotmod and connector.ini into the current WoT mods version folder.')
+finally:
+    shutil.rmtree(work, ignore_errors=True)
+    if os.path.exists(out + '.tmp'):
+        os.remove(out + '.tmp')
