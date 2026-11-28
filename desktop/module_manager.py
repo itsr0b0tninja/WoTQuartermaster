@@ -103,7 +103,7 @@ class ModuleManager:
         self.resources=Runtime(self.base,core,resources).resources
         self.folder=self.base/'modules'; self.sets=self.folder/'sets'; self.state_path=self.folder/'module-state.json'
         self.state={'schema':1,'active':None,'previous':None,'pending':None,'trial':None,'has_previous':False,'hold':False,'rejected':None,'message':''}
-        self.runtime=None; self.warning=''
+        self.runtime=None; self.warning='';self._cleanup_failures={}
     def safe_dir(self,path,parent):
         if path.is_symlink() or path.resolve().parent!=parent.resolve(): raise ValueError('Unsafe managed directory: '+path.name)
         path.mkdir(parents=True,exist_ok=True)
@@ -157,6 +157,7 @@ class ModuleManager:
         return checked_bytes(p.read_bytes(),mid,e)
     def discard(self,g):
         if not g or g in (self.state['active'],self.state['previous'],self.state['pending'],self.state['trial']): return
+        if self._cleanup_failures.get(g,0)>=3:return
         try:
             p=self.generation_path(g); marker=p/'set.json'
             if not marker.exists() and not marker.is_symlink():
@@ -173,7 +174,9 @@ class ModuleManager:
                 if child.name in names or (child.name.startswith('.qm-') and child.name.endswith('.tmp')):
                     if child.is_file() and not child.is_symlink(): child.unlink()
             if all(x.name=='set.json' for x in p.iterdir()): marker.unlink(); p.rmdir()
-        except (OSError,ValueError,TypeError,KeyError) as exc: logging.warning('Could not clean obsolete module set %s: %s',g,exc)
+        except (OSError,ValueError,TypeError,KeyError) as exc:
+            self._cleanup_failures[g]=self._cleanup_failures.get(g,0)+1
+            logging.warning('Could not clean obsolete module set %s (attempt %d/3; protected sets retained): %s',g,self._cleanup_failures[g],exc)
     def cleanup(self):
         for p in self.sets.iterdir():
             if GEN.fullmatch(p.name): self.discard(p.name)

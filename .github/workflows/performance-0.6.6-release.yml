@@ -1,0 +1,79 @@
+name: Build verify and publish WoTQuartermaster 0.6.6 performance
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/performance-0.6.6-release.yml'
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: module-manifest-publication
+  cancel-in-progress: false
+jobs:
+  performance:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          architecture: x64
+      - name: Functional and worker regressions
+        run: |
+          python .github/scripts/test_progression_0_6_6.py
+          if ($LASTEXITCODE -ne 0) { throw 'Advisor regression failed' }
+          python .github/scripts/test_performance_0_6_6.py
+          if ($LASTEXITCODE -ne 0) { throw 'Worker regression failed' }
+          python .github/scripts/test_budget_0_6_6.py
+          if ($LASTEXITCODE -ne 0) { throw 'Budget regression failed' }
+          python .github/scripts/test_model_0_6_6.py
+          if ($LASTEXITCODE -ne 0) { throw 'Model worker regression failed' }
+          python .github/scripts/publish_performance_0_6_6.py
+          if ($LASTEXITCODE -ne 0) { throw 'Compatibility failed' }
+      - name: Windows UI responsiveness and module activation
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python -m pip install --disable-pip-version-check PySide6==6.8.3 Pillow==11.3.0 PyInstaller==6.14.2
+          if ($LASTEXITCODE -ne 0) { throw 'Dependencies failed' }
+          python .github/scripts/build_module_index_0_3_2.py
+          if ($LASTEXITCODE -ne 0) { throw 'Bootstrap failed' }
+          python .github/scripts/test_performance_0_6_6_ui.py
+          if ($LASTEXITCODE -ne 0) { throw 'UI regression failed' }
+      - name: Core updater regression and executable compilation
+        run: |
+          Copy-Item desktop/module_manager_online.py module_manager_online.py
+          Copy-Item desktop/module_manager.py module_manager.py
+          Copy-Item desktop/module_runtime.py module_runtime.py
+          Copy-Item desktop/module_shared.py module_shared.py
+          Copy-Item desktop/WoTQuartermaster_v0.6.3.txt WoTQuartermaster.py
+          (Get-Content desktop/test_updater_v0.3.3.txt -Raw).Replace('desktop/WoTQuartermaster_v0.3.3.txt','desktop/WoTQuartermaster_v0.6.3.txt') | Set-Content -Encoding utf8 test-updater-063.py
+          python test-updater-063.py
+          if ($LASTEXITCODE -ne 0) { throw 'Updater regression failed' }
+          python -m PyInstaller --noconfirm --clean --onefile --windowed --name WoTQuartermaster --hidden-import copy --hidden-import PIL.DdsImagePlugin --hidden-import PIL.Image --hidden-import PIL.PngImagePlugin --add-data "desktop/runtime_modules/index.json;runtime_modules" WoTQuartermaster.py
+          if ($LASTEXITCODE -ne 0) { throw 'Build failed' }
+      - name: Compiled replacement and new module activation
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python .github/scripts/test_performance_0_6_6_ui.py --compiled
+          if ($LASTEXITCODE -ne 0) { throw 'Compiled upgrade failed' }
+      - name: Publish verified core and modules
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          git fetch origin main
+          test "$(git rev-parse origin/main)" = "$GITHUB_SHA"
+          git checkout -B main origin/main
+          python .github/scripts/publish_performance_0_6_6.py --publish
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add components.json
+          if ! git diff --cached --quiet; then
+            git commit -m "Publish verified WoTQuartermaster 0.6.6 performance core and modules"
+            git push origin main
+          fi
