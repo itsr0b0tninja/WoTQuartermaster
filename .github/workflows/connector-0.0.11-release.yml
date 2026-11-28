@@ -1,0 +1,124 @@
+name: Build and publish connector 0.0.11 and compatible core
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/connector-0.0.11-release.yml'
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: module-manifest-publication
+  cancel-in-progress: false
+jobs:
+  connector:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build Python 2.7 package and test
+        run: |
+          docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" -w /work python:2.7.18 python .github/scripts/test_connector_0_0_11.py
+          docker run --rm --user "$(id -u):$(id -g)" -v "$PWD/connector:/work" -w /work python:2.7.18 python Build_WoT_Connector_v0.0.11.txt
+          mkdir -p connector-assets
+          cp connector/wot_companion_connector.wotmod connector-assets/
+          cp connector/connector.ini.example connector-assets/connector.ini
+          python3 - <<'PY'
+          import zipfile
+          with zipfile.ZipFile('connector-assets/wot_companion_connector.wotmod') as z:
+              assert z.testzip() is None
+              assert z.namelist()==['res/scripts/client/gui/mods/mod_wot_companion_connector.pyc']
+              b=z.read(z.namelist()[0])
+              assert b[:4]==bytes.fromhex('03f30d0a')
+              for marker in (b'0.0.11',b'configuration_audit',b'configuration-audit-v1',b'supplemental-audit-v1',b'targeted-audit-v1',b'battle_context.json',b'connector.ini'):
+                  assert marker in b
+          PY
+          cd connector-assets
+          sha256sum wot_companion_connector.wotmod > wot_companion_connector.sha256.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: connector-011
+          path: connector-assets/
+  core:
+    runs-on: windows-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          architecture: x64
+      - run: python -m pip install --disable-pip-version-check PySide6==6.8.3 Pillow==11.3.0 PyInstaller==6.14.2
+      - name: Verify compatibility and updater regressions
+        shell: pwsh
+        run: |
+          python .github/scripts/build_module_index_0_3_2.py
+          if ($LASTEXITCODE -ne 0) { throw 'Module bootstrap verification failed' }
+          Copy-Item desktop/module_manager_online.py module_manager_online.py
+          Copy-Item desktop/module_manager.py module_manager.py
+          Copy-Item desktop/module_runtime.py module_runtime.py
+          Copy-Item desktop/module_shared.py module_shared.py
+          Copy-Item desktop/WoTQuartermaster_v0.6.5.txt WoTQuartermaster.py
+          (Get-Content desktop/test_updater_v0.3.3.txt -Raw).Replace('desktop/WoTQuartermaster_v0.3.3.txt','desktop/WoTQuartermaster_v0.6.5.txt') | Set-Content -Encoding utf8 test-updater-065.py
+          python test-updater-065.py
+          if ($LASTEXITCODE -ne 0) { throw 'Updater regression failed' }
+          @'
+          import WoTQuartermaster as q
+          from module_manager import validate_modules
+          from pathlib import Path
+          import json
+          assert q.VERSION=='0.6.5'
+          for version in ('0.0.8','0.0.9','0.0.10','0.0.11'):
+              c=dict(schema=1,connector_version=version,session='s',game_version='2.4.2.0',heartbeat_at=100)
+              ctx=dict(c,state='garage')
+              assert q.connection(c,ctx,True,True,100)[0]=='garage'
+              assert q.connection(c,dict(ctx,connector_version='0.0.7'),True,True,100)[0]=='stale'
+          assert q.connection(dict(c,connector_version='0.0.7'),ctx,True,True,100)[0]=='version'
+          manifest=json.loads(Path('components.json').read_text())
+          assert manifest['modules']['progression']['version']=='0.1.7'
+          validate_modules(manifest)
+          print('All three connector versions accepted; mixed context rejected.')
+          '@ | Set-Content -Encoding utf8 test-compat-065.py
+          python test-compat-065.py
+          if ($LASTEXITCODE -ne 0) { throw 'Compatibility regression failed' }
+      - name: Build portable core
+        shell: pwsh
+        run: |
+          python -m PyInstaller --noconfirm --clean --onefile --windowed --name WoTQuartermaster --hidden-import copy --hidden-import PIL.DdsImagePlugin --hidden-import PIL.Image --hidden-import PIL.PngImagePlugin --add-data "desktop/runtime_modules/index.json;runtime_modules" WoTQuartermaster.py
+          if ($LASTEXITCODE -ne 0) { throw 'Build failed' }
+          $digest = (Get-FileHash dist/WoTQuartermaster.exe -Algorithm SHA256).Hash.ToLowerInvariant()
+          Set-Content -Path dist/WoTQuartermaster.sha256.txt -Value "$digest  WoTQuartermaster.exe" -Encoding ascii
+      - uses: actions/upload-artifact@v4
+        with:
+          name: core-065
+          path: |
+            dist/WoTQuartermaster.exe
+            dist/WoTQuartermaster.sha256.txt
+  publish:
+    needs: [connector,core]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - uses: actions/download-artifact@v4
+        with:
+          name: connector-011
+          path: connector-assets
+      - uses: actions/download-artifact@v4
+        with:
+          name: core-065
+          path: core-assets
+      - name: Publish and update existing manifest
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          python3 .github/scripts/publish_connector_0_0_11.py
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add components.json
+          if ! git diff --cached --quiet; then
+            git commit -m "Publish connector 0.0.11 and core 0.6.5 compatibility update"
+            git push origin main
+          fi
