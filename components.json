@@ -69,13 +69,13 @@
       "dependencies": {
         "battle_performance": "0.1.3"
       },
-      "min_core": "0.6.0",
-      "release": "finance-v0.1.1",
+      "min_core": "0.6.1",
+      "release": "finance-v0.1.2",
       "required": true,
-      "sha256": "9bdc234f7365b01a16dc443f15a94bf94e13ccab25d41fbd8356f66c464062e0",
-      "size": 25342,
-      "url": "https://github.com/itsr0b0tninja/WoTQuartermaster/releases/download/finance-v0.1.1/finance.qmodule",
-      "version": "0.1.1"
+      "sha256": "70bcfe7c63422ab7e328f6d33e94d5286f04edc4145c981594b3722fa3954ebb",
+      "size": 25696,
+      "url": "https://github.com/itsr0b0tninja/WoTQuartermaster/releases/download/finance-v0.1.2/finance.qmodule",
+      "version": "0.1.2"
     },
     "garage": {
       "api": 1,
@@ -122,16 +122,16 @@
       "channel": "alpha",
       "dependencies": {
         "battle_performance": "0.1.3",
-        "finance": "0.1.1",
+        "finance": "0.1.2",
         "research": "0.1.1"
       },
-      "min_core": "0.6.0",
-      "release": "progression-v0.1.3",
+      "min_core": "0.6.1",
+      "release": "progression-v0.1.4",
       "required": true,
-      "sha256": "4e6cf797d6c6a51ae05f53dd111bdd3e5ad057fb8a9985d5946acb3d648d206b",
-      "size": 54599,
-      "url": "https://github.com/itsr0b0tninja/WoTQuartermaster/releases/download/progression-v0.1.3/progression.qmodule",
-      "version": "0.1.3"
+      "sha256": "3ff83b37f10238979b0a49208517a95aaa60d60797719f40720491f69a3e04b2",
+      "size": 85601,
+      "url": "https://github.com/itsr0b0tninja/WoTQuartermaster/releases/download/progression-v0.1.4/progression.qmodule",
+      "version": "0.1.4"
     },
     "research": {
       "api": 1,
@@ -147,7 +147,7 @@
       "version": "0.1.1"
     }
   },
-  "product_version": "0.6.3",
+  "product_version": "0.6.4",
   "retired_modules": [
     "diagnostic"
   ],
