@@ -7,22 +7,22 @@
       "game_versions": [
         "2.4.2.0"
       ],
-      "min_desktop": "0.6.5",
-      "release": "connector-v0.0.11",
-      "sha256": "9c6a6a86ac26f9ba6d23c01ef513113382662cabd9cdea927ad254bd3d47e7ec",
-      "size": 164001,
-      "url": "https://github.com/itsr0b0tninja/WoTQuartermaster/releases/download/connector-v0.0.11/wot_companion_connector.wotmod",
-      "version": "0.0.11"
+      "min_desktop": "0.6.6",
+      "release": "connector-v0.0.12",
+      "sha256": "873b963fde7f7a55f85b7a50640d5ed399bd575d68e0147689ec029cb6b5475e",
+      "size": 169036,
+      "url": "https://github.com/itsr0b0tninja/WoTQuartermaster/releases/download/connector-v0.0.12/wot_companion_connector.wotmod",
+      "version": "0.0.12"
     },
     "desktop": {
       "asset": "WoTQuartermaster.exe",
       "channel": "alpha",
       "min_desktop": "0.2.0",
-      "release": "v0.6.5",
-      "sha256": "c47129821cd5cec09871362e80c68a1b8ecd94ad2279c5457a0f5ffd2e21c260",
-      "size": 55820143,
-      "url": "https://github.com/itsr0b0tninja/WoTQuartermaster/releases/download/v0.6.5/WoTQuartermaster.exe",
-      "version": "0.6.5"
+      "release": "v0.6.6",
+      "sha256": "1880c64a9795fd0f8852889c1b9a0488631e9cec9b62aeac7bbd6df59528c225",
+      "size": 55819366,
+      "url": "https://github.com/itsr0b0tninja/WoTQuartermaster/releases/download/v0.6.6/WoTQuartermaster.exe",
+      "version": "0.6.6"
     },
     "replay_parser": {
       "asset": "WoT_Quartermaster_Replay_Parser.txt",
@@ -68,12 +68,12 @@
       "channel": "alpha",
       "dependencies": {},
       "min_core": "0.6.4",
-      "release": "data_manager-v0.1.0",
+      "release": "data_manager-v0.1.1",
       "required": true,
-      "sha256": "f68ab2b373e8e759b76d38dd6a93c6e6ee7b680e3d93a0b1f7e0276c4777331a",
-      "size": 32488,
-      "url": "https://github.com/itsr0b0tninja/WoTQuartermaster/releases/download/data_manager-v0.1.0/data_manager.qmodule",
-      "version": "0.1.0"
+      "sha256": "30f233aae56c898149e9742c5d31ad0157951a4aaa83a511536a4e6868f25391",
+      "size": 32733,
+      "url": "https://github.com/itsr0b0tninja/WoTQuartermaster/releases/download/data_manager-v0.1.1/data_manager.qmodule",
+      "version": "0.1.1"
     },
     "finance": {
       "api": 1,
@@ -161,7 +161,7 @@
       "version": "0.1.1"
     }
   },
-  "product_version": "0.6.8",
+  "product_version": "0.6.9",
   "retired_modules": [
     "diagnostic"
   ],
