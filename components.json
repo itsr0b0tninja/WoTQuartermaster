@@ -18,11 +18,11 @@
       "asset": "WoTQuartermaster.exe",
       "channel": "alpha",
       "min_desktop": "0.2.0",
-      "release": "v0.6.1",
-      "sha256": "045536d0f208930cd3f69d68a80819f72de840baf082c206ec018ac952f651e9",
-      "size": 55813488,
-      "url": "https://github.com/itsr0b0tninja/WoTQuartermaster/releases/download/v0.6.1/WoTQuartermaster.exe",
-      "version": "0.6.1"
+      "release": "v0.6.2",
+      "sha256": "f0d423e85c4b56c8057d189d071e6cdff5be3ece91d6c98980c97ea72e4eca79",
+      "size": 55815233,
+      "url": "https://github.com/itsr0b0tninja/WoTQuartermaster/releases/download/v0.6.2/WoTQuartermaster.exe",
+      "version": "0.6.2"
     },
     "replay_parser": {
       "asset": "WoT_Quartermaster_Replay_Parser.txt",
@@ -126,12 +126,12 @@
         "research": "0.1.1"
       },
       "min_core": "0.6.1",
-      "release": "progression-v0.1.4",
+      "release": "progression-v0.1.5",
       "required": true,
-      "sha256": "3ff83b37f10238979b0a49208517a95aaa60d60797719f40720491f69a3e04b2",
-      "size": 85601,
-      "url": "https://github.com/itsr0b0tninja/WoTQuartermaster/releases/download/progression-v0.1.4/progression.qmodule",
-      "version": "0.1.4"
+      "sha256": "cf89aa2598906c13503b48b8303a69182373cfe643e29c82c6153af97bafabb2",
+      "size": 95823,
+      "url": "https://github.com/itsr0b0tninja/WoTQuartermaster/releases/download/progression-v0.1.5/progression.qmodule",
+      "version": "0.1.5"
     },
     "research": {
       "api": 1,
@@ -147,7 +147,7 @@
       "version": "0.1.1"
     }
   },
-  "product_version": "0.6.4",
+  "product_version": "0.6.5",
   "retired_modules": [
     "diagnostic"
   ],
