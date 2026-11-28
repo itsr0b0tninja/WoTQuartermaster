@@ -1,0 +1,63 @@
+name: Verify and publish WoTQuartermaster 0.6.4
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/progression-0.6.4-release.yml'
+      - 'modules/progression/0.1.4/progression.qmodule'
+      - 'modules/finance/0.1.2/finance.qmodule'
+      - '.github/scripts/*0_6_4*.py'
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: module-manifest-publication
+  cancel-in-progress: false
+jobs:
+  progression:
+    runs-on: windows-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Integrated progression and finance regression
+        run: |
+          python .github/scripts/test_progression_0_6_4.py
+          if ($LASTEXITCODE -ne 0) { throw 'Regression failed' }
+          python .github/scripts/publish_progression_0_6_4.py
+          if ($LASTEXITCODE -ne 0) { throw 'Compatibility failed' }
+      - name: Core 0.6.1 module activation and desktop UI
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python -m pip install --disable-pip-version-check PySide6==6.8.3 Pillow==11.3.0
+          if ($LASTEXITCODE -ne 0) { throw 'UI dependencies failed' }
+          python .github/scripts/test_progression_0_6_4_ui.py
+          if ($LASTEXITCODE -ne 0) { throw 'UI or activation failed' }
+      - name: Package verified modules
+        uses: actions/upload-artifact@v4
+        with:
+          name: progression-finance-0.6.4-test
+          path: |
+            modules/progression/0.1.4/progression.qmodule
+            modules/finance/0.1.2/finance.qmodule
+          if-no-files-found: error
+      - name: Publish verified paired update
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          git fetch origin main
+          test "$(git rev-parse origin/main)" = "$GITHUB_SHA"
+          git checkout -B main origin/main
+          python .github/scripts/publish_progression_0_6_4.py --publish
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add components.json
+          if ! git diff --cached --quiet; then
+            git commit -m "Publish verified WoTQuartermaster 0.6.4 paired modules"
+            git push origin main
+          fi
