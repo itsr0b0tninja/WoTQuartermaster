@@ -1,0 +1,56 @@
+name: Verify and publish WoTQuartermaster 0.6.7 data modules
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/data-0.6.7-release.yml'
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: module-manifest-publication
+  cancel-in-progress: false
+jobs:
+  data:
+    runs-on: windows-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Validate data source manager, native stock evidence and progression
+        run: |
+          python .github/scripts/test_data_manager_0_6_7.py
+          if ($LASTEXITCODE -ne 0) { throw 'Data manager tests failed' }
+          python .github/scripts/test_progression_0_6_7.py
+          if ($LASTEXITCODE -ne 0) { throw 'Progression regression failed' }
+          python .github/scripts/publish_data_0_6_7.py
+          if ($LASTEXITCODE -ne 0) { throw 'Module compatibility failed' }
+      - name: Core 0.6.4 actual Qt window and updater module activation
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python -m pip install --disable-pip-version-check PySide6==6.8.3 Pillow==11.3.0
+          if ($LASTEXITCODE -ne 0) { throw 'Dependencies failed' }
+          python .github/scripts/build_module_index_0_3_2.py
+          if ($LASTEXITCODE -ne 0) { throw 'Bootstrap failed' }
+          python .github/scripts/test_data_0_6_7_ui.py
+          if ($LASTEXITCODE -ne 0) { throw 'UI regression failed' }
+      - name: Publish verified module set
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          git fetch origin main
+          test "$(git rev-parse origin/main)" = "$GITHUB_SHA"
+          git checkout -B main origin/main
+          python .github/scripts/publish_data_0_6_7.py --publish
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add components.json
+          if ! git diff --cached --quiet; then
+            git commit -m "Publish verified WoTQuartermaster 0.6.7 data modules"
+            git push origin main
+          fi
