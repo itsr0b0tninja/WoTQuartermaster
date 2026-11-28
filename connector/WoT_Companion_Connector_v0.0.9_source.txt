@@ -1,0 +1,2376 @@
+# -*- coding: ascii -*-
+# WoT Companion Connector 0.0.9 - local, read-only feasibility prototype.
+# Python 2.7 compatible. Game loader calls init() and fini().
+import os
+import json
+import time
+import traceback
+import re
+import xml.etree.ElementTree as ET
+import BigWorld
+
+VERSION = '0.0.9'
+INTERVAL = 10.0
+DEBOUNCE = 0.75
+try:
+    text_type = unicode
+    integer_types = (int, long)
+except NameError:
+    text_type = str
+    integer_types = (int,)
+
+
+def log(message):
+    print('[WoTCompanionConnector] ' + message)
+
+
+def output_path():
+    global PORTABLE_EXPORT
+    PORTABLE_EXPORT=read_connector_config()
+    return os.path.join(PORTABLE_EXPORT,'connector.json')
+
+
+def atomic_write(path, data):
+    folder = os.path.dirname(path)
+    if not os.path.isdir(folder):
+        try:
+            os.makedirs(folder)
+        except OSError:
+            if not os.path.isdir(folder):
+                raise
+    temp = path + '.tmp'
+    try:
+        with open(temp, 'wb') as stream:
+            stream.write(json.dumps(data, ensure_ascii=True, indent=2,
+                                    sort_keys=True).encode('ascii'))
+        if os.name == 'nt':
+            # Preserve previous complete export if replacement fails.
+            try:
+                import ctypes
+            except ImportError:
+                # Some embedded runtimes lack ctypes; rename with backup.
+                backup = path + '.bak'
+                if os.path.exists(backup):
+                    os.remove(backup)
+                if os.path.exists(path):
+                    os.rename(path, backup)
+                try:
+                    os.rename(temp, path)
+                except Exception:
+                    if os.path.exists(backup) and not os.path.exists(path):
+                        os.rename(backup, path)
+                    raise
+                if os.path.exists(backup):
+                    os.remove(backup)
+            else:
+                move = ctypes.windll.kernel32.MoveFileExW
+                move.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_ulong]
+                move.restype = ctypes.c_int
+                if not move(text_type(temp), text_type(path), 1):
+                    raise OSError('MoveFileExW failed: %s' % ctypes.GetLastError() if hasattr(ctypes, 'GetLastError') else 'MoveFileExW failed')
+        else:
+            os.rename(temp, path)
+    finally:
+        if os.path.exists(temp):
+            try:
+                os.remove(temp)
+            except OSError:
+                pass
+
+
+def number(value):
+    if isinstance(value, integer_types) and not isinstance(value, bool):
+        return int(value)
+    raise ValueError('Expected integer')
+
+
+def field(obj, name, convert, errors, label):
+    try:
+        return convert(getattr(obj, name))
+    except Exception as exc:
+        errors[label] = type(exc).__name__
+        return None
+
+
+def name_text(value):
+    if isinstance(value, bytes) and not isinstance(value, text_type):
+        return value.decode('utf-8', 'replace')
+    return text_type(value)
+
+
+def collect(cache, current):
+    stats = cache.items.stats
+    errors = {}
+    data = {}
+    for key, attr in [('credits', 'credits'), ('gold', 'gold'),
+                      ('bonds', 'crystal'), ('free_xp', 'freeXP')]:
+        data[key] = field(stats, attr, number, errors, key)
+    data['premium'] = field(stats, 'isPremium', bool, errors, 'premium')
+    data['premium_expiry'] = field(stats, 'activePremiumExpiryTime', number,
+                                   errors, 'premium_expiry')
+    data['selected_tank'] = None
+    try:
+        if current.isPresent():
+            veh = current.item
+            tank = {'tank_id': number(veh.intCD),
+                    'name': field(veh, 'userName', name_text, errors, 'tank_name'),
+                    'tier': field(veh, 'level', number, errors, 'tank_tier')}
+            try:
+                tank['combat_xp'] = number(stats.vehiclesXPs.get(tank['tank_id'], 0))
+            except Exception as exc:
+                errors['combat_xp'] = type(exc).__name__
+                tank['combat_xp'] = None
+            data['selected_tank'] = tank
+    except Exception as exc:
+        errors['selected_tank'] = type(exc).__name__
+    return data, errors
+
+
+# Explicit, read-only projections. Never dump arbitrary account objects,
+# credentials, network packets or unbounded object __dict__ values.
+PORTABLE_EXPORT = None
+FULL_INTERVAL = 30.0
+
+def read_connector_config():
+    # Search only the active game-version folder, not older versions.
+    import io
+    try: import ConfigParser as configparser
+    except ImportError: import configparser
+    roots=[os.getcwd(),os.path.dirname(os.getcwd())]
+    try:
+        import ResMgr
+        appdir=ResMgr.appDirectory()
+        roots.extend([appdir,os.path.dirname(os.path.normpath(appdir))])
+    except Exception: pass
+    paths=[]
+    for root in roots:
+        if not isinstance(root,text_type):
+            try: root=root.decode('mbcs' if os.name=='nt' else 'utf-8')
+            except Exception: continue
+        root=os.path.abspath(root)
+        try:
+            tree=ET.parse(os.path.join(root,'version.xml'))
+            version=None
+            for el in tree.getroot().iter():
+                if el.tag.lower() in ('version','versionname','clientversion') and el.text:
+                    m=re.search(r'\d+\.\d+\.\d+\.\d+',el.text)
+                    if m: version=m.group(0); break
+            if version:
+                p=os.path.join(root,'mods',version,'connector.ini')
+                if p not in paths: paths.append(p)
+        except Exception: pass
+    for path in paths:
+        if not os.path.isfile(path): continue
+        parser=configparser.RawConfigParser()
+        # UTF-8, BOM accepted, literal percent signs, no interpolation.
+        with io.open(path,'r',encoding='utf-8-sig') as f:
+            if hasattr(parser,'read_file'): parser.read_file(f)
+            else: parser.readfp(f)
+        value=parser.get('Connector','data_path').strip()
+        if not os.path.isabs(value): raise ValueError('connector.ini data_path must be absolute')
+        if not os.path.isdir(value): raise ValueError('connector.ini data_path must be an existing directory')
+        return os.path.join(os.path.normpath(value),'connector')
+    raise RuntimeError('connector.ini not found in current mods version folder; check game root/version.xml and INI installation')
+
+
+def plain(value, depth=0):
+    if depth > 20:
+        raise ValueError('Data nesting limit')
+    if value is None or isinstance(value, (bool, float) + integer_types):
+        return value
+    if isinstance(value, (text_type, bytes)):
+        return name_text(value)
+    if hasattr(value, '_asdict'):
+        return plain(value._asdict(), depth+1)
+    if isinstance(value, dict):
+        return {name_text(k): plain(v, depth+1) for k, v in value.items()}
+    if isinstance(value, (tuple, list, set, frozenset)):
+        seq = sorted(value, key=lambda x: name_text(x)) if isinstance(value, (set, frozenset)) else value
+        return [plain(v, depth+1) for v in seq]
+    raise TypeError('Unsupported value: ' + type(value).__name__)
+
+
+class Unavailable(Exception):
+    pass
+
+
+class Probe(object):
+    def __init__(self):
+        self.errors = {}
+        self.checked = 0
+        self.details = {}
+
+    def get(self, label, fn):
+        self.checked += 1
+        try:
+            value = plain(fn())
+            json.dumps(value, allow_nan=False)
+            return value
+        except Exception as exc:
+            self.errors[label] = type(exc).__name__
+            self.details[label] = {'status': 'unavailable' if isinstance(exc, (Unavailable, AttributeError)) else 'error', 'exception': type(exc).__name__, 'field': label}
+            return None
+
+    def attrs(self, obj, names, prefix):
+        return {name: self.get(prefix + '.' + name, lambda n=name: getattr(obj, n)) for name in names.split()}
+
+
+def item_row(item, p, path):
+    if item is None:
+        return None
+    return p.attrs(item, 'intCD userName itemTypeID', path)
+
+
+def skill_row(skill, p, path):
+    if skill is None:
+        return None
+    if isinstance(skill, (text_type, bytes)):
+        return {'name': name_text(skill)}
+    return p.attrs(skill, 'name level', path)
+
+
+def crew_row(tm, p, path):
+    row = p.attrs(tm, 'invID fullUserName nationID role combinedRoles vehicleInvID vehicleSlotIdx isInTank isDismissed roleLevel skillsLevels skillsCount maxSkillsCount newSkillsCount newFreeSkillsCount selectedFreeSkillsCount freeSkillsNames bonusSkillsCountByRole bonusSkillsLevels bonusSlotsLevels newBonusSkillsCountByRole currentVehicleSkillsEfficiency', path)
+    row['native_vehicle_id'] = p.get(path+'.native_vehicle_id', lambda: tm.vehicleNativeDescr.type.compactDescr)
+    row['free_crew_xp'] = p.get(path+'.free_crew_xp', lambda: tm.descriptor.freeXP)
+    row['skills_efficiency'] = p.get(path+'.skills_efficiency', lambda: tm.descriptor.skillsEfficiency)
+    row['next_skill_xp_cost'] = p.get(path+'.next_skill_xp_cost', lambda: tm.getNextSkillXpCost())
+    row['skills'] = p.get(path+'.skills', lambda: [skill_row(s,p,path+'.skills.%d'%i) for i,s in enumerate(tm.skills)])
+    row['bonus_skills'] = p.get(path+'.bonus_skills', lambda: {role:[skill_row(s,p,path+'.bonus_skills.%s.%d'%(role,i)) for i,s in enumerate(seq)] for role,seq in tm.bonusSkills.items()})
+    return row
+
+
+def installed(veh, attr, p, path):
+    slots = getattr(veh, attr).installed
+    out = []
+    for i in range(len(slots)):
+        item = slots[i]
+        row = item_row(item, p, path+'.%d'%i)
+        if row is not None:
+            row['slot_index'] = i
+            if attr == 'shells':
+                row['count'] = p.get(path+'.%d.count'%i, lambda: item.count)
+        out.append(row)
+    return out
+
+
+def garage_rows(items, p):
+    rows = []
+    for inv_id in sorted(items.inventory.getInvIDsIterator()):
+        path = 'vehicle.%s'%inv_id
+        def one():
+            veh = items.getVehicle(inv_id)
+            row = p.attrs(veh, 'intCD invID userName name level nationID type isElite isPremium isRented isPurchased isUnlocked isLocked', path)
+            row['combat_xp'] = p.get(path+'.combat_xp', lambda: number(items.stats.vehiclesXPs.get(veh.intCD,0)))
+            row['modules'] = {a:p.get(path+'.'+a, lambda a=a:item_row(getattr(veh,a),p,path+'.'+a)) for a in ('gun','turret','engine','chassis','radio','fuelTank')}
+            for a in ('optDevices','shells','consumables','battleBoosters'):
+                row[a] = p.get(path+'.'+a, lambda a=a:installed(veh,a,p,path+'.'+a))
+            row['crew_slots'] = p.get(path+'.crew_slots', lambda:[{'slot':s,'crew_id':tm.invID if tm else None} for s,tm in veh.crew])
+            row['unlock_edges'] = p.get(path+'.unlock_edges', lambda:veh.descriptor.type.unlocksDescrs)
+            row['ammo_capacity'] = p.get(path+'.ammo_capacity', lambda:veh.descriptor.gun.maxAmmo)
+            row['shells_layout'] = p.get(path+'.shells_layout', lambda:[{'intCD':s.intCD,'count':s.count} for s in veh.shells.layout if s is not None])
+            row['purchase_price'] = p.get(path+'.purchase_price', lambda:{k: getattr(veh.buyPrices.itemPrice.price,k) for k in ('credits','gold','crystal')})
+            row['resale_price'] = p.get(path+'.resale_price', lambda:money_row(veh.sellPrices.itemPrice.price))
+            row['personal_discount_price'] = p.get(path+'.personal_discount_price', lambda: None if veh.getPersonalDiscountPrice() is None else {k:getattr(veh.getPersonalDiscountPrice(),k) for k in ('credits','gold','crystal')})
+            return row
+        rows.append({'inventory_id':inv_id,'vehicle':p.get(path,one)})
+    return rows
+
+
+def account_extra(items,p):
+    out = p.attrs(items.stats, 'eventCoin bpcoin equipCoin postProgressionXP vehicleSlots tankmenBerthsCount totalPremiumExpiryTime freeTankmenLeft vehicleSellsLeft freeVehiclesLeft', 'stats')
+    out['free_vehicle_slots'] = p.get('free_vehicle_slots', lambda:items.inventory.getFreeSlots(items.stats.vehicleSlots))
+    out['free_barracks_slots'] = p.get('free_barracks_slots', lambda:items.freeTankmenBerthsCount())
+    return out
+
+
+def research(items,p):
+    from gui.shared.gui_items import GUI_ITEM_TYPE
+    from items import getTypeOfCompactDescr
+    ids = p.get('unlocks', lambda:sorted(items.stats.unlocks))
+    out = {'unlocked_item_ids':ids,'initial_unlocks':p.get('initial_unlocks',lambda:items.stats.initialUnlocks),'vehicle_xp':p.get('vehicle_xp',lambda:items.stats.vehiclesXPs)}
+    out['unlocked_vehicle_ids'] = p.get('unlocked_vehicle_ids',lambda:[i for i in ids if getTypeOfCompactDescr(i)==GUI_ITEM_TYPE.VEHICLE])
+    out['unlocked_module_ids'] = p.get('unlocked_module_ids',lambda:[i for i in ids if getTypeOfCompactDescr(i) in GUI_ITEM_TYPE.VEHICLE_MODULES])
+    return out
+
+
+def crew_rows(items,p):
+    return {name_text(i):p.get('crew.%s'%i,lambda:crew_row(tm,p,'crew.%s'%i)) for i,tm in items.getInventoryTankmen().items()}
+
+
+def money_row(m):
+    if m is None:
+        return None
+    return {k:m.get(k) for k in ('credits','gold','crystal','eventCoin','bpcoin','equipCoin')}
+
+
+def price_row(item,p,path):
+    row = item_row(item,p,path)
+    if row is None:
+        raise Unavailable('Item not found')
+    row['item_type_name'] = p.get(path+'.item_type_name',lambda:item.itemTypeName)
+    row['inventory_count'] = p.get(path+'.inventory_count',lambda:item.inventoryCount)
+    row['buy'] = p.get(path+'.buy',lambda:money_row(item.buyPrices.itemPrice.price))
+    row['default_buy'] = p.get(path+'.default_buy',lambda:money_row(item.buyPrices.itemPrice.defPrice))
+    row['sell'] = p.get(path+'.sell',lambda:money_row(item.sellPrices.itemPrice.price))
+    return row
+
+
+def inventory_stock(items,name):
+    from gui.shared.gui_items import GUI_ITEM_TYPE as T
+    if name=='BATTLE_BOOSTER':
+        from gui.shared.utils.requesters import vehicle_items_getter
+        raw=items.inventory.getItems(T.EQUIPMENT)
+        if not isinstance(raw,dict):
+            raise Unavailable('Shared equipment inventory absent')
+        ids=set(vehicle_items_getter.getItemsIterator(items.shop.getItemsData(),itemTypeID=T.BATTLE_BOOSTER,onlyWithPrices=False))
+        if not ids:
+            raise Unavailable('Battle booster identities absent')
+        return {cd:count for cd,count in raw.items() if cd in ids}
+    return items.inventory.getItems(getattr(T,name))
+
+
+def depot(items,p):
+    from gui.shared.gui_items import GUI_ITEM_TYPE as T
+    from constants import CustomizationInvData
+    out = {}
+    for name in 'CHASSIS TURRET GUN ENGINE FUEL_TANK RADIO OPTIONALDEVICE SHELL EQUIPMENT BATTLE_BOOSTER CREW_BOOKS CREW_SKINS CUSTOMIZATION DEMOUNT_KIT RECERTIFICATION_FORM MENTORING_LICENSE LOOT_BOX'.split():
+        def one():
+            typ = getattr(T,name)
+            if name == 'CUSTOMIZATION':
+                raw = items.inventory.getCacheValue(typ)
+                if raw is not None:
+                    raw = raw.get(CustomizationInvData.ITEMS,{})
+            else:
+                raw = inventory_stock(items,name)
+            if raw is None:
+                raise Unavailable('Inventory category absent from synced cache')
+            return raw
+        out[name] = p.get(name,one)
+    return out
+
+
+def depot_details(items,p):
+    from gui.shared.gui_items import GUI_ITEM_TYPE as T
+    out = {}
+    # Enrich only actual stock, not every possible item in the shop.
+    for name in 'CHASSIS TURRET GUN ENGINE FUEL_TANK RADIO OPTIONALDEVICE SHELL EQUIPMENT BATTLE_BOOSTER CREW_BOOKS'.split():
+        def one():
+            raw = inventory_stock(items,name)
+            if raw is None:
+                raise Unavailable('Inventory category absent')
+            rows = {}
+            for cd,count in raw.items():
+                if not isinstance(cd,integer_types) or not isinstance(count,integer_types) or count <= 0:
+                    continue
+                rows[cd] = {'count':count,'item':p.get(name+'.%s'%cd,lambda cd=cd:price_row(items.getItemByCD(cd),p,name+'.%s'%cd))}
+            return rows
+        out[name] = p.get(name,one)
+    return out
+
+
+def goodies(items,p):
+    return {'goodies':p.get('goodies',lambda:items.goodies.goodies),'active_clan_reserves':p.get('clan_reserves',lambda:items.goodies.getActiveClanReserves())}
+
+
+def blueprints(items,p):
+    b = items.blueprints
+    return {'available':p.get('available',lambda:b.isBlueprintsAvailable()),'universal_fragments':p.get('universal',lambda:b.getIntelligenceCount()),'national_fragments':p.get('national',lambda:b.getAllNationalFragmentsData()),'has_fragments':p.get('has_fragments',lambda:b.hasBlueprintsOrFragments()),'fragment_cache':p.get('fragment_cache',lambda:b.getCacheValue('cache'))}
+
+
+def dossier_row(d,p,path):
+    result = {}
+    # Use the game's own statistics wrappers rather than serializing descriptors.
+    methods = 'getBattlesCount getWinsCount getLossesCount getDrawsCount getSurvivedBattlesCount getDamageDealt getDamageReceived getFragsCount getShotsCount getHitsCount getSpottedEnemiesCount getXP getAvgXP getAvgDamage getDamageAssistedRadio getDamageAssistedTrack getDamageBlockedByArmor getMarksOfMastery'
+    for mode,method in [('random','getRandomStats'),('total','getTotalStats')]:
+        def one():
+            obj = getattr(d,method)()
+            values = {}
+            for n in methods.split():
+                if hasattr(obj,n):
+                    values[n] = p.get(path+'.'+mode+'.'+n,lambda n=n:getattr(obj,n)())
+            if not values:
+                raise Unavailable('No supported statistics fields')
+            return values
+        result[mode] = p.get(path+'.'+mode,one)
+    # Achievement blocks use the client descriptor's indexed access.
+    def achievements():
+        from dossiers2.ui import layouts
+        out = {}
+        for block,name in layouts.getAchievementsLayout(d.getDossierType()):
+            def one():
+                values = d.getBlock(block)
+                return values.get(name) if hasattr(values,'get') else values[name]
+            v = p.get(path+'.achievement.'+name_text(block)+'.'+name_text(name),one)
+            if v is not None:
+                out.setdefault(block,{})[name] = v
+        return out
+    result['achievements'] = p.get(path+'.achievements',achievements)
+    return result
+
+
+def statistics(items,p):
+    def vehicles():
+        out = {}
+        for cd,_ in items.getVehicleDossiersIterator():
+            out[cd] = p.get('vehicle.%s'%cd,lambda cd=cd:dossier_row(items.getVehicleDossier(cd),p,'vehicle.%s'%cd))
+        return out
+    return {'account':p.get('account_dossier',lambda:dossier_row(items.getAccountDossier(),p,'account')),'vehicles':p.get('vehicle_dossiers',vehicles)}
+
+
+def missions(items,p):
+    from helpers import dependency
+    from skeletons.gui.server_events import IEventsCache
+    cache = dependency.instance(IEventsCache)
+    out = {}
+    for name in ('getQuests','getDailyQuests','getWeeklyQuests'):
+        def one():
+            rows = {}
+            for qid,q in getattr(cache,name)().items():
+                path = name+'.'+name_text(qid)
+                row = {n:p.get(path+'.'+n,lambda n=n:getattr(q,n)()) for n in ('getID','getUserName','getType','getGroupID','isCompleted','getStartTime','getFinishTime','getDescription')}
+                row['getProgress'] = p.get(path+'.getProgressData',lambda:q.getProgressData())
+                row['rewards'] = p.get(path+'.getRawBonuses',lambda:q.getRawBonuses())
+                row['conditions'] = p.get(path+'.conditions',lambda:{k:v for k,v in q.getData().items() if k in ('conditions','condition','account','vehicle','preBattle','postBattle','bonusCond','requirements')})
+                row['bonus_count'] = p.get(path+'.getBonusCount',lambda:q.getBonusCount())
+                rows[qid] = row
+            return rows
+        out[name] = p.get(name,one)
+    return out
+
+
+def shop_discounts(items,p):
+    out = {}
+    out['vehicle_discount_ids'] = p.get('vehicle_discount_ids',lambda:sorted(items.shop.getVehicleDiscountDescriptions().keys()))
+    # Definitions are not entitlements. Export the account's actual active subset.
+    def personal():
+        rows = {}
+        for key,d in items.shop.personalVehicleDiscounts.items():
+            rows[key] = p.get('discount.%s'%key,lambda d=d:{'target':d.target,'resource':d.resource})
+        return rows
+    out['personal_vehicle_discounts'] = p.get('personal_vehicle_discounts',personal)
+    return out
+
+
+def progression(items,p):
+    from gui.shared.gui_items import GUI_ITEM_TYPE as T
+    from items import getTypeOfCompactDescr
+    unlocks = set(items.stats.unlocks)
+    defaults = set(items.stats.initialUnlocks)
+    out = {'additional_unlock_ids':sorted(unlocks-defaults),'initial_unlock_ids':sorted(defaults),'owned_vehicle_paths':{}}
+    # Read only direct research edges from each owned tank; the full tree is a desktop catalogue task.
+    for inv in sorted(items.inventory.getInvIDsIterator()):
+        def one():
+            veh = items.getVehicle(inv)
+            path = 'vehicle.%s'%veh.intCD
+            rows = []
+            for edge in veh.descriptor.type.unlocksDescrs:
+                if len(edge)<2:
+                    continue
+                xp,cd = edge[:2]
+                row = {'target_id':cd,'xp_raw':xp,'raw_edge':list(edge),'prerequisite_ids':list(edge[2:]),'unlocked':cd in unlocks,'default_unlock':cd in defaults,'prerequisite_unlocked':{i:i in unlocks for i in edge[2:]}}
+                def detail():
+                    item = items.getItemByCD(cd)
+                    d = price_row(item,p,path+'.target.%s'%cd)
+                    if getTypeOfCompactDescr(cd)==T.VEHICLE:
+                        d['tier'] = p.get(path+'.tier.%s'%cd,lambda:item.level)
+                        d['personal_discount_price'] = p.get(path+'.personal.%s'%cd,lambda:money_row(items.shop.getPersonalVehicleDiscountPrice(cd)))
+                        d['blueprint_discount_pct'] = p.get(path+'.blueprint.%s'%cd,lambda:items.blueprints.getBlueprintDiscount(cd,item.level))
+                        d['blueprint_adjusted_xp'] = p.get(path+'.blueprint_xp.%s'%cd,lambda:items.blueprints.calculateCost(xp,d['blueprint_discount_pct']) if d['blueprint_discount_pct'] is not None else None)
+                    return d
+                row['target'] = p.get(path+'.target.%s'%cd,detail)
+                rows.append(row)
+            return {'vehicle_id':veh.intCD,'combat_xp':items.stats.vehiclesXPs.get(veh.intCD,0),'edges':rows}
+        out['owned_vehicle_paths'][inv] = p.get('inventory.%s'%inv,one)
+    return out
+
+
+COLLECTORS = [('account_extra',account_extra),('research',research),('garage',garage_rows),('crew',crew_rows),('depot',depot),('goodies',goodies),('blueprints',blueprints),('statistics',statistics),('missions',missions),('discounts',shop_discounts),('depot_details',depot_details),('progression',progression)]
+
+
+def current_shop_prices(items,p):
+    prices = items.shop.getPrices()
+    return {'prices':p.get('prices',lambda:{cd:prices.getPrices(cd) for cd,_ in prices.items()}),
+            'hidden_item_ids':p.get('hidden_item_ids',lambda:sorted(items.shop.getHiddens())),
+            'vehicles_not_to_buy':p.get('vehicles_not_to_buy',lambda:sorted(items.shop.getNotToBuyVehicles()))}
+
+
+COLLECTORS.append(('current_shop_prices',current_shop_prices))
+
+
+def comprehensive(items):
+    sections = {}
+    for label, fn in COLLECTORS:
+        p = Probe()
+        start = time.time()
+        def run():
+            required = {'account_extra':('stats','inventory'),'research':('stats',),'garage':('inventory','stats'),'crew':('inventory',),'depot':('inventory',),'goodies':('goodies',),'blueprints':('blueprints',),'statistics':('dossiers',),'discounts':('shop',),'current_shop_prices':('shop',),'depot_details':('inventory','shop'),'progression':('inventory','stats','shop','blueprints')}
+            for name in required.get(label,()):
+                requester = getattr(items,name)
+                if not requester.isSynced():
+                    raise Unavailable('Requester not synced')
+            return fn(items,p)
+        data = p.get(label, run)
+        sections[label] = {'status':(p.details.get(label,{}).get('status','unavailable') if data is None else ('partial' if p.errors else ('empty' if data in ({},[]) else 'ok'))), 'data':data,'errors':p.errors,'error_details':p.details,'checks':p.checked,'elapsed_ms':int((time.time()-start)*1000)}
+    return sections
+
+
+
+# Static catalogue: only allowlisted public game definitions, never account objects.
+CATALOGUE_SCHEMA = 2
+CAT_TYPES = [('vehicles','VEHICLE'),('chassis','CHASSIS'),('turrets','TURRET'),('guns','GUN'),('engines','ENGINE'),('radios','RADIO'),('ammunition','SHELL'),('equipment','OPTIONALDEVICE'),('consumables','EQUIPMENT'),('boosters','BATTLE_BOOSTER'),('camouflage','CAMOUFLAGE'),('styles','STYLE'),('crew_books','CREW_BOOKS'),('crew_perks',None),('maps',None)]
+
+
+def read_json(path):
+    with open(path,'rb') as f:
+        return json.load(f)
+
+
+def digest_file(path):
+    import hashlib
+    h = hashlib.sha256()
+    with open(path,'rb') as f:
+        while True:
+            chunk = f.read(65536)
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def safe_key(value):
+    # Include full build string in the key, not just major.minor.patch.
+    import hashlib
+    v = name_text(value)
+    return re.sub(r'[^A-Za-z0-9._-]', '_', v).strip('._')[:70]+'-'+hashlib.sha256(v.encode('utf-8')).hexdigest()[:12]
+
+
+def append_record(path, row):
+    folder = os.path.dirname(path)
+    if not os.path.isdir(folder):
+        os.makedirs(folder)
+    # One writer (game client), one complete JSON object per line. A reader
+    # must tolerate an incomplete final line after an abrupt process exit.
+    encoded = json.dumps(plain(row),ensure_ascii=True,allow_nan=False,sort_keys=True).encode('ascii')
+    with open(path,'a+b') as f:
+        f.seek(0,os.SEEK_END)
+        if f.tell():
+            f.seek(-1,os.SEEK_END)
+            if f.read(1)!=b'\n': f.write(b'\n')
+        f.write(encoded+b'\n')
+        f.flush()
+
+
+def optional_attrs(obj, names, p, prefix):
+    out = {}
+    for n in names.split():
+        if hasattr(obj,n):
+            out[n] = p.get(prefix+'.'+n,lambda n=n:getattr(obj,n))
+    return out
+
+
+# Extract the lazy parameter proxy one property at a time. The provider's
+# getParamsDict is independent of the user's technical-info UI setting.
+def parameter_map(obj,p,prefix):
+    from gui.shared.items_parameters import params_helper
+    import inspect
+    provider = params_helper._getParamsProvider(obj)
+    proxy = provider.getParamsDict()
+    result = {}
+    keys = list(proxy) if isinstance(proxy,dict) else [k for k,_ in inspect.getmembers(type(provider),lambda x:isinstance(x,property))]
+    for key in keys:
+        try:
+            value = proxy[key]
+        except KeyError:
+            continue # Conditional parameter not applicable to this item.
+        except Exception as exc:
+            p.errors[prefix+'.'+key] = type(exc).__name__
+            continue
+        value = p.get(prefix+'.'+key,lambda:value)
+        if value is not None:
+            result[key] = value
+    if not result:
+        raise Unavailable('No usable calculated parameters')
+    return result
+
+
+def artefact_kpis(obj,p):
+    return p.get('kpi',lambda:[optional_attrs(v,'name value type specValue vehicleTypes isDebuff isSituational',p,'kpi.%s'%i) for i,v in enumerate(obj.getKpi())])
+
+
+def catalogue_row(items, cat, cd):
+    p = Probe()
+    item = items.getItemByCD(cd)
+    if item is None:
+        raise Unavailable('Catalogue item absent')
+    if cat == 'vehicles':
+        # Stock descriptor avoids account-specific equipment and crew modifiers.
+        stock = items.getStockVehicle(cd)
+        if stock is None:
+            raise Unavailable('Stock vehicle absent')
+        obj = stock
+    else:
+        obj = item
+    row = item_row(obj,p,'identity')
+    if row is None or row.get('intCD') != cd or row.get('userName') is None:
+        raise ValueError('Incomplete catalogue identity')
+    row.update(optional_attrs(obj,'name nationID level itemTypeName type isPremium isCollectible isSecret',p,'item'))
+    # Default price only in versioned catalogue. Current prices remain in the
+    # separate timestamped shop/account snapshot.
+    row['default_buy'] = p.get('default_buy',lambda:money_row(item.buyPrices.itemPrice.defPrice))
+    row['default_sell'] = p.get('default_sell',lambda:money_row(item.sellPrices.itemPrice.defPrice))
+    if cat == 'vehicles':
+        d = stock.descriptor
+        row['research_edges'] = plain(d.type.unlocksDescrs)
+        row['vehicle_type'] = optional_attrs(d.type,'name tags crewRoles level maxHealth speedLimits invisibility',p,'vehicle_type')
+        row['compatible_modules'] = {}
+        for attr in ('chassis','engines','radios','fuelTanks'):
+            row['compatible_modules'][attr] = p.get('compatible_modules.'+attr,lambda attr=attr:[m.compactDescr for m in getattr(d.type,attr)])
+        row['compatible_modules']['turrets_and_guns'] = p.get('compatible_modules.turrets_and_guns',lambda:[{'turret':t.compactDescr,'guns':[g.compactDescr for g in t.guns]} for group in d.type.turrets for t in group])
+        row['stock_modules'] = {}
+        for n in ('chassis','turret','gun','engine','radio','fuelTank'):
+            v = getattr(d,n,None)
+            if v is not None:
+                row['stock_modules'][n] = optional_attrs(v,'compactDescr name userString level',p,'stock.'+n)
+        from gui.shared.items_parameters import params_helper
+        row['stock_parameters'] = p.get('stock_parameters',lambda:parameter_map(stock,p,'stock_parameters'))
+    elif cat in ('chassis','turrets','guns','engines','radios','ammunition','equipment','consumables','boosters'):
+        row['description'] = optional_attrs(obj,'shortDescription fullDescription',p,'description')
+        row['parameters'] = p.get('parameters',lambda:parameter_map(obj,p,'parameters'))
+        d = obj.descriptor
+        row['descriptor_fields'] = optional_attrs(d,'name tags level weight maxHealth maxLoad rotationSpeed power fireChance fireStartingChance distance circularVisionRadius armor reloadTime aimingTime shotDispersionAngle shotDispersionFactors caliber speed gravity damage piercingPower maxDistance kind price vehicleFilter incompatibleTags',p,'descriptor')
+        if cat == 'equipment':
+            row['kpi'] = artefact_kpis(obj,p)
+            row['vehicle_level_range'] = p.get('vehicle_level_range',lambda:obj.getVehicleLevelRange())
+        if cat == 'guns':
+            row['shell_ids'] = p.get('shell_ids',lambda:[s.shell.compactDescr for s in d.shots])
+    else:
+        row['description'] = optional_attrs(obj,'shortDescription fullDescription',p,'description')
+    row['field_errors'] = p.errors
+    return row
+
+
+def catalogue_special(cat):
+    if cat == 'maps':
+        import ArenaType
+        for key,a in ArenaType.g_cache.items():
+            p = Probe()
+            row = optional_attrs(a,'geometryID geometryName gameplayID gameplayName name description explicitRequestOnly minPlayersInTeam maxPlayersInTeam',p,'map')
+            if not row.get('geometryName'):
+                raise Unavailable('Map geometry identity missing')
+            row['field_errors'] = p.errors
+            yield name_text(key),row
+    elif cat == 'crew_perks':
+        from items import tankmen
+        for name in tankmen.SKILL_NAMES:
+            p = Probe()
+            row = {'name':name,'roles':p.get('roles',lambda:tankmen.ROLES_BY_SKILLS.get(name))}
+            try:
+                skill = tankmen.getSkillsConfig().getSkill(name)
+            except Exception as exc:
+                row['field_errors'] = {'definition':type(exc).__name__}
+                yield name_text(name),row
+                continue
+            row.update(optional_attrs(skill,'name userString description role isGroupSkill',p,'skill'))
+            if hasattr(skill,'params'):
+                row['params'] = {name_text(k):optional_attrs(v,'name value situational',p,'skill_param') for k,v in skill.params.items()}
+            if hasattr(skill,'kpi'):
+                row['kpi'] = []
+                for k in skill.kpi:
+                    row['kpi'].append(optional_attrs(k,'name value type operation',p,'kpi'))
+            row['field_errors'] = p.errors
+            yield name_text(name),row
+
+
+def catalogue_iter(items, cat, typ):
+    if typ is None:
+        seen=set()
+        for key,row in catalogue_special(cat):
+            if key not in seen:
+                seen.add(key)
+                yield key,row
+    else:
+        from gui.shared.gui_items import GUI_ITEM_TYPE
+        from gui.shared.utils.requesters import vehicle_items_getter
+        seen = set()
+        for cd in vehicle_items_getter.getItemsIterator(items.shop.getItemsData(),itemTypeID=getattr(GUI_ITEM_TYPE,typ),onlyWithPrices=False):
+            if cd in seen:
+                continue
+            seen.add(cd)
+            yield name_text(cd),None
+
+
+PARAM_CATS = frozenset(('chassis','turrets','guns','engines','radios','ammunition','equipment','consumables','boosters'))
+
+
+def required_parameter(cat):
+    return 'stock_parameters' if cat=='vehicles' else ('parameters' if cat in PARAM_CATS else None)
+
+
+def required_missing(cat,row):
+    field = required_parameter(cat)
+    if field and (not isinstance(row.get(field),dict) or not any(v is not None for k,v in row[field].items() if k not in ('compatible','parameters','base'))):
+        return field
+    if cat=='crew_perks' and 'definition' in row.get('field_errors',{}):
+        return 'skill_definition'
+    return None
+
+
+def needs_retry(cat,row):
+    if not isinstance(row,dict) or not row or required_missing(cat,row):
+        return True
+    return bool(row.get('field_errors'))
+
+
+def repair_row(items,cat,key,old):
+    # Preserve all successful legacy fields; replace the broken parameter wrapper.
+    field = required_parameter(cat)
+    errors = old.get('field_errors',{})
+    if field and (required_missing(cat,old) or any(k==field or k.startswith(field+'.') for k in errors)) and all(k==field or k.startswith(field+'.') for k in errors):
+        p = Probe()
+        obj = items.getStockVehicle(int(key)) if cat=='vehicles' else items.getItemByCD(int(key))
+        values = p.get(field,lambda:parameter_map(obj,p,field))
+        row = dict(old)
+        # Never retain the v1 wrapper's bogus 'parameters' value.
+        old_values = old.get(field)
+        previous = {k:v for k,v in old_values.items() if v is not None} if isinstance(old_values,dict) and field+'.parameters' not in errors else {}
+        previous.update(values or {})
+        row[field] = previous or None
+        if cat=='equipment':
+            row['kpi']=artefact_kpis(obj,p)
+            row['vehicle_level_range']=p.get('vehicle_level_range',lambda:obj.getVehicleLevelRange())
+        row['field_errors'] = dict(p.errors)
+        return row
+    return catalogue_row(items,cat,int(key))
+
+
+def catalogue_summary(cat,rows,failures):
+    counts,missing = {},{}
+    for row in rows.values():
+        bad = required_missing(cat,row)
+        if bad:
+            missing[bad] = missing.get(bad,0)+1
+        for field in row.get('field_errors',{}):
+            counts[field] = counts.get(field,0)+1
+    return counts,missing
+
+
+class Catalogue(object):
+    def __init__(self,owner):
+        self.owner=owner
+        self.status={'status':'waiting'}
+        self.callback=None
+        self.version=None
+        self.folder=None
+        self.root=None
+        self.index=0
+        self.rows={}
+        self.failures={}
+        self.files={}
+        self.attempted=False
+        self.started=False
+        self.generation=None
+        self.seed=None
+        self.keys=None
+        self.cursor=0
+        self.batch=[]
+        self.processed=0
+        self.reused=0
+        self.repaired=0
+        self.retried=0
+        self.total=None
+        self.plans={}
+        self.started_at=None
+        self.last_progress=None
+        self.last_notice=0
+        self.last_notice_state=None
+        self.last_notice_pct=-5
+        self.notice_error=None
+        self.resumed=False
+        self.journal_errors=[]
+        self.progress_recovered=0
+
+    def load_category(self,folder,cat,info=None):
+        path=os.path.join(folder,cat+'.json')
+        if info is not None and (info.get('file')!=cat+'.json' or digest_file(path)!=info.get('sha256')):
+            raise ValueError('Catalogue checksum mismatch')
+        payload=read_json(path)
+        if payload.get('schema') not in (1,CATALOGUE_SCHEMA) or payload.get('game_version')!=self.version or payload.get('category')!=cat or not isinstance(payload.get('rows'),dict):
+            raise ValueError('Catalogue identity mismatch')
+        if info is not None and len(payload['rows'])!=info.get('count'):
+            raise ValueError('Catalogue row count mismatch')
+        return payload
+
+    def valid(self,manifest,folder,version):
+        if manifest.get('game_version')!=version or manifest.get('schema')!=CATALOGUE_SCHEMA or manifest.get('status')!='complete':
+            return False
+        entries=manifest.get('files',{})
+        if set(entries)!=set(n for n,t in CAT_TYPES):
+            return False
+        for cat,info in entries.items():
+            if info.get('count',0)<=0 or info.get('row_failures') or info.get('required_missing') or info.get('field_error_counts'):
+                return False
+            if digest_file(os.path.join(folder,cat+'.json'))!=info.get('sha256'):
+                return False
+        return True
+
+    def candidates(self,version_dir):
+        out=[]
+        for name in os.listdir(version_dir):
+            if not re.match(r'^\d+-\d+$',name):
+                continue
+            folder=os.path.join(version_dir,name)
+            for fn in ('manifest.json','progress.json'):
+                try:
+                    m=read_json(os.path.join(folder,fn))
+                    if m.get('game_version')==self.version and m.get('schema',1) in (1,CATALOGUE_SCHEMA):
+                        out.append((folder,m,fn))
+                        break
+                except Exception:
+                    pass
+        return sorted(out,key=lambda x:(int(os.path.basename(x[0]).split('-')[0]),os.path.basename(x[0])),reverse=True)
+
+    def ensure(self):
+        if not self.owner.active:
+            return
+        if self.callback is not None:
+            if self.last_progress and time.time()-self.last_progress>60:
+                self.status.update(status='stalled',error='No catalogue progress for 60 seconds')
+                try:
+                    BigWorld.cancelCallback(self.callback)
+                except Exception:
+                    pass
+                self.callback=None
+                self.attempted=True
+                self.save_progress()
+                self.notify(force=True)
+            return
+        if not self.started:
+            self.version=self.owner.game_version()
+            if not self.version:
+                self.status={'status':'waiting_for_game_version'}
+                return
+            self.root=os.path.join(os.path.dirname(PORTABLE_EXPORT),'catalogue')
+            version_dir=os.path.join(self.root,safe_key(self.version))
+            if not os.path.isdir(version_dir):
+                os.makedirs(version_dir)
+            candidates=self.candidates(version_dir)
+            # Prefer latest valid complete catalogue, irrespective of abandoned drafts.
+            for folder,m,fn in candidates:
+                try:
+                    if self.valid(m,folder,self.version):
+                        self.folder=folder
+                        # Rebase only location metadata of a validated generation.
+                        if m.get('folder')!=folder or m.get('relative_path')!=os.path.relpath(folder,self.root):
+                            m=dict(m,folder=folder,relative_path=os.path.relpath(folder,self.root))
+                            try: atomic_write(os.path.join(folder,'manifest.json'),m)
+                            except Exception as exc: self.owner.report_error(exc)
+                        self.status=dict(m,status='reused',folder=folder,completed_categories=len(CAT_TYPES),total_categories=len(CAT_TYPES),percent=100,items_processed=sum(i['count'] for i in m['files'].values()),items_total=sum(i['count'] for i in m['files'].values()),original_enumerated_count=m.get('items_total'))
+                        self.started=self.attempted=True
+                        self.activate(folder)
+                        return
+                except Exception:
+                    pass
+            # Resume an unfinished schema-2 generation; a finished partial generation
+            # becomes a read-only seed for a new incremental repair generation.
+            if candidates:
+                folder,m,fn=candidates[0]
+                if fn=='progress.json' and m.get('schema')==CATALOGUE_SCHEMA:
+                    self.folder=folder
+                    self.generation=os.path.basename(folder)
+                    self.resumed=True
+                    self.files=dict(m.get('files',{}))
+                    seed=m.get('seed_generation')
+                    if seed and re.match(r'^\d+-\d+$',seed) and seed!=self.generation:
+                        self.seed=os.path.join(version_dir,seed)
+                else:
+                    self.seed=folder
+                    self.resumed=True
+            if self.folder is None:
+                self.generation=self.owner.session
+                self.folder=os.path.join(version_dir,self.generation)
+            self.started=True
+            self.started_at=time.time()
+            self.last_progress=self.started_at
+            self.status={'schema':CATALOGUE_SCHEMA,'status':'building','game_version':self.version,'folder':self.folder,'completed_categories':0,'total_categories':len(CAT_TYPES),'resumed':self.resumed,'seed_generation':os.path.basename(self.seed) if self.seed else None,'files':self.files}
+            self.save_progress()
+        if not self.attempted:
+            if self.status.get('status')=='paused':
+                self.status['status']='building'
+                self.last_progress=time.time()
+                self.notify(force=True)
+            self.callback=BigWorld.callback(0.1,self.tick)
+
+    def activate(self,folder):
+        generation=os.path.basename(folder)
+        atomic_write(os.path.join(os.path.dirname(folder),'latest.json'),{'generation':generation})
+        atomic_write(os.path.join(self.root,'manifest.json'),{'schema':CATALOGUE_SCHEMA,'game_version':self.version,'status':'complete','relative_path':os.path.join(safe_key(self.version),generation)})
+
+    def save_progress(self):
+        atomic_write(os.path.join(self.folder,'progress.json'),self.status)
+
+    def update_progress(self):
+        cat=CAT_TYPES[self.index][0] if self.index<len(CAT_TYPES) else None
+        self.status.update(completed_categories=self.index,files=self.files,current_category=cat,category_processed=self.cursor,category_total=len(self.keys) if self.keys is not None else None,items_processed=self.processed,items_total=self.total,percent=round(100.0*self.processed/self.total,1) if self.total and not any(v is None for v in self.plans.values()) else None,items_reused=self.reused,items_repaired=self.repaired,items_retried=self.retried,elapsed_seconds=int(time.time()-self.started_at),last_progress_at=self.last_progress,journal_errors=self.journal_errors[-10:],notification_error=self.notice_error,checkpoint_records_recovered=self.progress_recovered)
+
+    def notify(self,force=False):
+        # Native garage messages only. Do not notify in battle or while loading.
+        try:
+            from helpers import isPlayerAccount
+            if not isPlayerAccount() or self.owner.game_state not in ('garage','garage_selection_unavailable'):
+                return
+            state=self.status.get('status')
+            if state not in ('building','reused','complete','partial','error','stalled'):
+                return
+            now=time.time()
+            changed=state!=self.last_notice_state
+            if self.notice_error and now-self.last_notice<30 and not force:
+                return
+            if not force and not changed and (state!='building' or (now-self.last_notice<60 and (self.status.get('percent') or 0)<self.last_notice_pct+5)):
+                return
+            if now-self.last_notice<3 and not changed and not force:
+                return
+            from gui import SystemMessages
+            if state=='building':
+                if self.status.get('items_total') is None:
+                    msg='Connected. '+('Recovering saved catalogue...' if self.resumed else 'Preparing game catalogue...')
+                else:
+                    pct=self.status.get('percent')
+                    msg='Catalogue %s: %s/%s enumerated items. %s. %ss elapsed. Progress saved.'%((str(pct)+'%') if pct is not None else 'in progress',self.processed,self.total,self.status.get('current_category') or 'Validating',self.status.get('elapsed_seconds',0))
+            elif state=='reused':
+                msg='Connected. Game catalogue is up to date.'
+            elif state=='complete':
+                msg='Catalogue complete. %s items validated.'%self.processed
+            elif state=='partial':
+                msg='Catalogue finished with warnings. %s items processed. See diagnostics.'%self.processed
+            else:
+                msg='Catalogue '+state+'. Saved progress retained. See diagnostics.'
+            self.last_notice=now
+            SystemMessages.pushMessage('WoTQuartermaster v'+VERSION+': '+msg,type=SystemMessages.SM_TYPE.Warning if state in ('partial','error','stalled') else SystemMessages.SM_TYPE.Information)
+            self.last_notice_state=state
+            self.last_notice_pct=self.status.get('percent') or 0
+            self.notice_error=None
+            self.status['notification_error']=None
+        except Exception as exc:
+            self.notice_error=type(exc).__name__+': '+name_text(exc)[:160]
+            self.status['notification_error']=self.notice_error
+            self.last_notice=time.time()
+
+    def plan(self,items):
+        # Enumerate identities once. Do not fetch item parameters in this phase.
+        for cat,typ in CAT_TYPES:
+            try:
+                self.plans[cat]=list(catalogue_iter(items,cat,typ))
+            except Exception as exc:
+                self.plans[cat]=None
+                self.journal_errors.append(cat+' enumeration: '+name_text(exc)[:150])
+        self.total=sum(len(v) for v in self.plans.values() if v is not None)
+
+    def journal_path(self,cat):
+        return os.path.join(self.folder,cat+'.checkpoint.jsonl')
+
+    def load_journal(self,cat):
+        path=self.journal_path(cat)
+        if not os.path.exists(path):
+            return
+        # Repair an incomplete trailing write before appending new batches.
+        with open(path,'rb+') as f:
+            while True:
+                pos=f.tell()
+                line=f.readline()
+                if not line:
+                    break
+                try:
+                    if not line.endswith(b'\n'):
+                        raise ValueError('Incomplete line')
+                    obj=json.loads(line)
+                    if obj.get('schema')!=CATALOGUE_SCHEMA or obj.get('game_version')!=self.version or obj.get('category')!=cat:
+                        raise ValueError('Checkpoint identity mismatch')
+                    for key,row in obj['rows'].items():
+                        if isinstance(row,dict):
+                            self.rows[key]=row
+                            self.progress_recovered+=1
+                except Exception as exc:
+                    # Keep preceding valid batches; retry this and subsequent rows.
+                    f.seek(pos)
+                    f.truncate()
+                    self.journal_errors.append(cat+' checkpoint repaired: '+type(exc).__name__)
+                    break
+
+    def flush(self,cat):
+        if not self.batch:
+            return
+        path=self.journal_path(cat)
+        if not os.path.isdir(self.folder):
+            os.makedirs(self.folder)
+        record={'schema':CATALOGUE_SCHEMA,'game_version':self.version,'category':cat,'rows':dict(self.batch)}
+        line=json.dumps(record,ensure_ascii=True,allow_nan=False,sort_keys=True).encode('ascii')+b'\n'
+        with open(path,'ab') as f:
+            f.write(line)
+            f.flush()
+            os.fsync(f.fileno())
+        self.batch=[]
+
+    def begin_category(self,cat):
+        self.keys=self.plans[cat]
+        self.cursor=0
+        self.rows={}
+        self.failures={}
+        if self.keys is None:
+            self.keys=[]
+            self.failures['enumeration']='Enumeration failed; not a complete category'
+        # Import completed v0.0.4 or v0.0.5 category files, with checksum checks
+        # whenever a manifest or progress file provides them.
+        for folder in (self.seed,self.folder):
+            if not folder:
+                continue
+            try:
+                meta=None
+                for fn in ('manifest.json','progress.json'):
+                    try:
+                        meta=read_json(os.path.join(folder,fn)).get('files',{}).get(cat)
+                        if meta:
+                            break
+                    except Exception:
+                        pass
+                if not meta:
+                    continue
+                payload=self.load_category(folder,cat,meta)
+                self.rows.update(payload['rows'])
+            except Exception as exc:
+                self.journal_errors.append(cat+' seed skipped: '+type(exc).__name__)
+        self.load_journal(cat)
+        # Discard identities no longer in this game enumeration, except on enumeration failure.
+        if 'enumeration' not in self.failures:
+            keys=set(k for k,r in self.keys)
+            self.rows={k:r for k,r in self.rows.items() if k in keys}
+
+    def tick(self):
+        self.callback=None
+        if not self.owner.active:
+            return
+        try:
+            from helpers import isPlayerAccount
+            cache=self.owner.cache
+            if not isPlayerAccount() or cache is None or cache.waitForSync or not cache.isSynced():
+                self.status['status']='paused'
+                self.save_progress()
+                return
+            self.status['status']='building'
+            items=cache.items
+            if self.total is None:
+                self.plan(items)
+            cat,typ=CAT_TYPES[self.index]
+            if self.keys is None:
+                self.begin_category(cat)
+            start=time.time()
+            # Fast scan reusable identities; expensive collection still capped per callback.
+            expensive=0
+            while self.cursor<len(self.keys) and expensive<20 and time.time()-start<0.012:
+                key,special=self.keys[self.cursor]
+                old=self.rows.get(key)
+                try:
+                    if old is not None and not needs_retry(cat,old):
+                        self.reused+=1
+                    else:
+                        expensive+=1
+                        row=special if special is not None else (repair_row(items,cat,key,old) if old else catalogue_row(items,cat,int(key)))
+                        self.rows[key]=row
+                        self.batch.append((key,row))
+                        if old:
+                            self.retried+=1
+                            if not needs_retry(cat,row):
+                                self.repaired+=1
+                except Exception as exc:
+                    self.failures[key]=type(exc).__name__+': '+name_text(exc)[:180]
+                self.cursor+=1
+                self.processed+=1
+            self.flush(cat)
+            self.last_progress=time.time()
+            self.update_progress()
+            if self.cursor>=len(self.keys):
+                self.finish_category(cat)
+            self.notify()
+            if not self.attempted:
+                self.callback=BigWorld.callback(0.1,self.tick)
+        except Exception as exc:
+            self.status.update(status='error',error=type(exc).__name__+': '+name_text(exc)[:200])
+            self.attempted=True
+            self.owner.report_error(exc)
+            try:
+                self.save_progress()
+            except Exception:
+                pass
+            self.notify(force=True)
+
+    def finish_category(self,cat):
+        counts,missing=catalogue_summary(cat,self.rows,self.failures)
+        path=os.path.join(self.folder,cat+'.json')
+        atomic_write(path,{'schema':CATALOGUE_SCHEMA,'game_version':self.version,'category':cat,'rows':self.rows,'row_errors':self.failures,'field_error_counts':counts,'required_missing':missing})
+        self.files[cat]={'file':cat+'.json','count':len(self.rows),'sha256':digest_file(path),'row_failures':len(self.failures),'required_missing':sum(missing.values()),'field_error_counts':counts}
+        self.index+=1
+        self.keys=None
+        self.cursor=0
+        self.update_progress()
+        # Commit metadata before removing checkpoint. Crash between these operations
+        # is safe; duplicate rows are keyed by identity on resume.
+        self.save_progress()
+        journal=self.journal_path(cat)
+        if os.path.exists(journal):
+            os.remove(journal)
+        if self.index==len(CAT_TYPES):
+            complete=all(f['count']>0 and not f['row_failures'] and not f['required_missing'] and not f['field_error_counts'] for f in self.files.values())
+            manifest=dict(self.status,status='complete' if complete else 'partial',items_with_required_missing=sum(f['required_missing'] for f in self.files.values()),row_failures=sum(f['row_failures'] for f in self.files.values()),field_error_count=sum(sum(f['field_error_counts'].values()) for f in self.files.values()),created_at=time.time(),validation='identity, required calculated parameters, field errors, enumeration and checksums',percent=100 if self.total and self.processed==self.total and not any(self.plans[c] is None for c,t in CAT_TYPES) else None)
+            atomic_write(os.path.join(self.folder,'manifest.json'),manifest)
+            self.status=manifest
+            if complete:
+                self.activate(self.folder)
+            self.attempted=True
+            log('Catalogue '+manifest['status'])
+        if self.owner.sections:
+            try:
+                self.owner.write_diagnostics()
+            except Exception as exc:
+                self.owner.report_error(exc)
+
+    def stop(self):
+        if self.callback is not None:
+            try:
+                BigWorld.cancelCallback(self.callback)
+            except Exception:
+                pass
+            self.callback=None
+        if self.started and not self.attempted:
+            if self.keys is not None and self.index<len(CAT_TYPES):
+                self.flush(CAT_TYPES[self.index][0])
+            self.status['status']='interrupted'
+            self.save_progress()
+
+
+# v0.0.6: additive enrichment. Base catalogue schema remains unchanged.
+ENRICH_SCHEMA = 1
+
+def extra_value(v, depth=0):
+    if depth > 15:
+        raise ValueError('enrichment nesting limit')
+    if isinstance(v, dict):
+        return {name_text(k):extra_value(x,depth+1) for k,x in v.items()}
+    if isinstance(v,(tuple,list,set,frozenset)):
+        return [extra_value(x,depth+1) for x in v]
+    if type(v).__name__ in ('Vector2','Vector3','Vector4'):
+        return [float(v[i]) for i in range(int(type(v).__name__[-1]))]
+    return plain(v)
+
+
+def extra_fields(obj, names, p, prefix):
+    out={}
+    for n in names.split():
+        out[n]=p.get(prefix+'.'+n,lambda n=n:extra_value(getattr(obj,n)))
+    return out
+
+
+def slot_rows(veh,p):
+    return [{'index':i,'slot':p.get('slot.%s'%i,lambda i=i:extra_fields(veh.optDevices.getSlot(i).item,'slotID categories',p,'slot.%s'%i)), 'dynamic':p.get('slot_dynamic.%s'%i,lambda i=i:veh.optDevices.getSlot(i).isDynamic)} for i in range(len(veh.optDevices.installed))]
+
+
+def fit_result(item,veh,slot=None):
+    result=item.mayInstall(veh,slot)
+    if not isinstance(result,(tuple,list)) or not result or not isinstance(result[0],bool):
+        raise Unavailable('Unexpected fitting result')
+    return {'allowed':result[0],'reason':name_text(result[1]) if len(result)>1 and result[1] is not None else None}
+
+
+def configured_performance(items,p):
+    out={}
+    for inv in sorted(items.inventory.getInvIDsIterator()):
+        veh=items.getVehicle(inv)
+        prefix='vehicle.%s'%inv
+        out[inv]={'vehicle_id':veh.intCD,'parameters':p.get(prefix+'.parameters',lambda:parameter_map(veh,p,prefix+'.parameters')),'crew_bonuses':p.get(prefix+'.crew_bonuses',lambda:veh.bonuses),'equipment_slots':p.get(prefix+'.slots',lambda:slot_rows(veh,p)), 'source':'live_configured_vehicle_parameter_provider','modules':{n:p.get(prefix+'.'+n,lambda n=n:getattr(veh,n).intCD) for n in ('chassis','turret','gun','engine','radio')}}
+    return out
+
+
+def specialist_stock(items,name):
+    mapping={'DEMOUNT_KIT':'demountKits','RECERTIFICATION_FORM':'recertificationForms','MENTORING_LICENSE':'mentoringLicenses'}
+    if name not in mapping:
+        return _inventory_stock_005(items,name)
+    if not items.goodies.isSynced() or not items.shop.isSynced():
+        raise Unavailable('Goodies/shop not synced')
+    definitions=getattr(items.shop,mapping[name])
+    owned=items.goodies.goodies
+    if not isinstance(definitions,dict) or not isinstance(owned,dict):
+        raise Unavailable('Goodie data unavailable')
+    # Empty result valid only with known definitions, not an unsupported API.
+    if not definitions:
+        raise Unavailable('No specialist goodie definitions')
+    return {k:int(v.count) for k,v in owned.items() if k in definitions and v.count>0}
+
+
+def training_costs(items,p):
+    return extra_fields(items.shop,'tankmanCost changeRoleCost freeXPToTManXPRate dropSkillsCost',p,'shop')
+
+
+def owned_equipment_compat(items,p):
+    # Current configuration only; no changes to live descriptors.
+    from gui.shared.gui_items import GUI_ITEM_TYPE as T
+    from gui.shared.utils.requesters import vehicle_items_getter
+    ids=list(set(vehicle_items_getter.getItemsIterator(items.shop.getItemsData(),itemTypeID=T.OPTIONALDEVICE,onlyWithPrices=False)))
+    out={}
+    for inv in sorted(items.inventory.getInvIDsIterator()):
+        veh=items.getVehicle(inv)
+        rows={}
+        slots=len(veh.optDevices.installed)
+        for cd in sorted(ids):
+            item=items.getItemByCD(cd)
+            if item is None:
+                continue
+            prefix='fit.%s.%s'%(inv,cd)
+            rows[cd]={'slots':[p.get(prefix+'.%s'%s,lambda s=s:fit_result(item,veh,s)) for s in range(slots)],'installed':p.get(prefix+'.installed',lambda:item.isInstalled(veh))}
+        out[inv]={'vehicle_id':veh.intCD,'slot_count':slots,'equipment':rows,'scope':'current_configuration_only'}
+    return out
+
+
+def equipment_costs(items,p):
+    from gui.shared.gui_items import GUI_ITEM_TYPE as T
+    from gui.shared.utils.requesters import vehicle_items_getter
+    ids=set(vehicle_items_getter.getItemsIterator(items.shop.getItemsData(),itemTypeID=T.OPTIONALDEVICE,onlyWithPrices=False))
+    out={}
+    for cd in sorted(ids):
+        item=items.getItemByCD(cd)
+        if item is not None:
+            out[cd]=p.get('removal.%s'%cd,lambda:money_row(item.getRemovalPrice(items).price))
+    return out
+
+
+def extra_collectors(items):
+    out={}
+    for label,fn in [('configured_performance',configured_performance),('equipment_compatibility',owned_equipment_compat),('equipment_removal_costs',equipment_costs),('crew_training_costs',training_costs)]:
+        p=Probe(); start=time.time()
+        data=p.get(label,lambda:fn(items,p))
+        out[label]={'status':'partial' if p.errors and data is not None else ('unavailable' if data is None else 'ok'),'data':data,'errors':p.errors,'error_details':p.details,'checks':p.checked,'elapsed_ms':int((time.time()-start)*1000)}
+    return out
+
+
+def copy_minimap(resource,folder,geometry):
+    import ResMgr
+    import hashlib
+    path=name_text(resource).replace('\\','/')
+    if not path or path.startswith('/') or ':' in path or '..' in path.split('/'):
+        raise Unavailable('Invalid minimap resource path')
+    sec=ResMgr.openSection(path)
+    if sec is None:
+        raise Unavailable('Minimap resource unavailable')
+    data=sec.asBinary
+    if not data or len(data)>32*1024*1024:
+        raise Unavailable('Minimap binary unavailable or too large')
+    if data.startswith(b'DDS '): ext='.dds'
+    elif data.startswith(b'\x89PNG\r\n\x1a\n'): ext='.png'
+    elif data.startswith(b'\xff\xd8\xff'): ext='.jpg'
+    else: raise Unavailable('Unrecognised minimap image encoding')
+    digest=hashlib.sha256(data).hexdigest()
+    rel='minimaps/'+safe_key(geometry)+'-'+digest[:12]+ext
+    target=os.path.join(folder,*rel.split('/'))
+    if not os.path.isdir(os.path.dirname(target)): os.makedirs(os.path.dirname(target))
+    if not os.path.exists(target) or digest_file(target)!=digest:
+        tmp=target+'.tmp'
+        with open(tmp,'wb') as f: f.write(data)
+        if os.path.exists(target): os.remove(target)
+        os.rename(tmp,target)
+    return {'file':rel,'sha256':digest,'bytes':len(data),'format':ext[1:]}
+
+
+def enrich_row(items,cat,key,folder):
+    p=Probe(); row={}
+    if cat=='maps':
+        import ArenaType
+        a=ArenaType.g_cache[int(key)]
+        row=extra_fields(a,'boundingBox teamBasePositions teamSpawnPoints minimap',p,'map')
+        box=row.get('boundingBox')
+        if box and len(box)==2:
+            row['dimensions_m']=[box[1][i]-box[0][i] for i in range(2)]
+        row['image']=p.get('map.image',lambda:copy_minimap(a.minimap,folder,a.geometryName))
+        row['availability']='not_verified'
+    elif cat=='crew_perks':
+        from items import tankmen
+        from gui.shared.utils import skill_presenter_helper as sh
+        skill=tankmen.getSkillsConfig().getSkill(key)
+        row['definition']=extra_fields(skill,'name typeName',p,'skill')
+        row['effects']=optional_attrs(skill,'crewLevelIncrease camouflageBonus repairSpeed fireFightingEfficiency',p,'effects')
+        if getattr(skill,'name',None)=='unknown' or key not in tankmen.ROLES_BY_SKILLS:
+            row['classification']='internal_or_non_role_definition'
+        else:
+            row['classification']='role_definition'
+            for label,fn in [('display_name',sh.getSkillUserName),('description',sh.getSkillUserDescription),('max_level_description',sh.getSkillMaxLvlDescription),('description_arguments',sh.getSkillDescrArgs)]:
+                row[label]=p.get(label,lambda fn=fn:extra_value(fn(key)))
+    else:
+        obj=items.getStockVehicle(int(key)) if cat=='vehicles' else items.getItemByCD(int(key))
+        if obj is None: raise Unavailable('Item not found')
+        d=obj.descriptor
+        if cat=='vehicles':
+            row['slots']=slot_rows(obj,p)
+            row['ammo_capacity']=p.get('ammo_capacity',lambda:d.gun.maxAmmo)
+            row['tags']=p.get('tags',lambda:d.type.tags)
+        elif cat=='guns':
+            row['shots']=[]
+            for i,s in enumerate(d.shots):
+                shot=extra_fields(s,'speed gravity maxDistance nominalMaxDistance piercingPower defaultPortion',p,'shot.%s'%i)
+                shot['shell_id']=p.get('shot.%s.shell_id'%i,lambda:s.shell.compactDescr)
+                row['shots'].append(shot)
+        elif cat in ('equipment','consumables'):
+            row['properties']=optional_attrs(obj,'isRemovable canUseDemountKit isRegular isDeluxe isTrophy isModernized isUpgradable isUpgraded isBuiltIn isForSale crewLevelIncrease',p,'item')
+            row['descriptor']=optional_attrs(d,'tags cooldown cooldownTime reuseTime duration activationDelay crewLevelIncrease removable',p,'descriptor')
+            row['kpi']=artefact_kpis(obj,p)
+            row['level_range']=p.get('level_range',lambda:obj.getVehicleLevelRange())
+        elif cat=='crew_books':
+            row['descriptor']=optional_attrs(d,'name tags xp experience crewXP bookType',p,'book')
+            row['description']=optional_attrs(obj,'shortDescription fullDescription',p,'book')
+    row['status']='partial' if p.errors else ('ok' if any(v not in (None,{},[]) for v in row.values()) else 'unavailable')
+    row['field_errors']=p.errors
+    return row
+
+
+class Enrichment(object):
+    CATS=('vehicles','guns','equipment','consumables','crew_perks','crew_books','maps')
+    def __init__(self,owner):
+        self.owner=owner; self.callback=None; self.folder=None; self.status={'status':'waiting'}; self.tasks=[]; self.rows={}; self.index=0; self.last_notice=0; self.last_pct=-5; self.started=None; self.done=False; self.batch=[]
+    def notify(self,msg,warning=False):
+        try:
+            from helpers import isPlayerAccount
+            if not isPlayerAccount(): return
+            from gui import SystemMessages
+            SystemMessages.pushMessage('WoTQuartermaster v'+VERSION+': '+msg,type=SystemMessages.SM_TYPE.Warning if warning else SystemMessages.SM_TYPE.Information)
+        except Exception as exc:
+            self.status['notification_error']=type(exc).__name__
+    def ensure(self):
+        base=self.owner.catalogue
+        if self.done or self.callback is not None or base.status.get('status') not in ('complete','reused') or not self.owner.active: return
+        if self.folder is None:
+            self.folder=os.path.join(base.folder,'enrichment-v1')
+            if not os.path.isdir(self.folder): os.makedirs(self.folder)
+            self.started=time.time()
+            self.identity={'schema':ENRICH_SCHEMA,'game_version':base.version,'base_checksums':{k:v['sha256'] for k,v in base.status['files'].items()}}
+            self.tasks=[]
+            for cat in self.CATS:
+                payload=base.load_category(base.folder,cat,base.status['files'][cat])
+                self.tasks.extend((cat,k) for k in sorted(payload['rows']))
+            self.rows={}
+            journal=os.path.join(self.folder,'checkpoint.jsonl')
+            if os.path.exists(journal):
+                with open(journal,'rb+') as f:
+                    while True:
+                        pos=f.tell(); line=f.readline()
+                        if not line: break
+                        try:
+                            obj=json.loads(line)
+                            if not line.endswith(b'\n') or obj['identity']!=self.identity: raise ValueError('Invalid checkpoint')
+                            for cat,key,row in obj['rows']: self.rows[(cat,key)]=row
+                        except Exception:
+                            f.seek(pos); f.truncate(); break
+            task_set=set(self.tasks)
+            self.rows={k:v for k,v in self.rows.items() if k in task_set}
+            self.status=dict(self.identity,status='building',folder=self.folder,total=len(self.tasks),processed=0,recovered=len(self.rows),base_records=sum(v['count'] for v in base.status['files'].values()),base_enumerated=base.status.get('original_enumerated_count',base.status.get('items_total')),category_counts={})
+            try:
+                manifest=read_json(os.path.join(self.folder,'manifest.json'))
+                if any(manifest.get(k)!=v for k,v in self.identity.items()) or manifest.get('status') not in ('complete','partial') or set(manifest.get('files',{}))!=set(self.CATS):
+                    raise ValueError('Enrichment manifest mismatch')
+                for cat,info in manifest['files'].items():
+                    path=os.path.join(self.folder,cat+'.json')
+                    if digest_file(path)!=info['sha256'] or info['count']!=sum(c==cat for c,k in self.tasks):raise ValueError('Enrichment checksum/count mismatch')
+                    if cat=='maps':
+                        for row in read_json(path)['rows'].values():
+                            img=row.get('image')
+                            if img and digest_file(os.path.join(self.folder,*img['file'].split('/')))!=img['sha256']:raise ValueError('Minimap checksum mismatch')
+                relative=os.path.relpath(self.folder,base.root)
+                if manifest.get('folder')!=self.folder or manifest.get('relative_path')!=relative:
+                    manifest=dict(manifest,folder=self.folder,relative_path=relative)
+                    try: atomic_write(os.path.join(self.folder,'manifest.json'),manifest)
+                    except Exception as exc: self.owner.report_error(exc)
+                self.status=dict(manifest,status='reused',validation_status=manifest['status']); self.done=True
+                self.notify('Additional details up to date.'+(' Some fields unavailable; see diagnostics.' if manifest['status']=='partial' else ''))
+                return
+            except Exception:
+                pass
+            # If an image is missing, only its map row needs recollection.
+            for task,row in list(self.rows.items()):
+                img=row.get('image')
+                if img:
+                    try:
+                        if digest_file(os.path.join(self.folder,*img['file'].split('/')))!=img['sha256']:del self.rows[task]
+                    except Exception:del self.rows[task]
+            self.status['recovered']=len(self.rows)
+            self.status['housekeeping']={'mode':'report_only','reason':'Existing generations retained until enrichment verified'}
+            self.notify('Base catalogue validated. Collecting additional details (saved records: %s).'%len(self.rows))
+            self.last_notice=time.time(); self.last_pct=0
+        self.callback=BigWorld.callback(0.1,self.tick)
+    def flush(self):
+        if not self.batch:return
+        path=os.path.join(self.folder,'checkpoint.jsonl')
+        with open(path,'ab') as f:
+            f.write(json.dumps({'identity':self.identity,'rows':self.batch},ensure_ascii=True,allow_nan=False).encode('ascii')+b'\n'); f.flush(); os.fsync(f.fileno())
+        self.batch=[]
+    def tick(self):
+        self.callback=None
+        try:
+            from helpers import isPlayerAccount
+            cache=self.owner.cache
+            if not self.owner.active:return
+            if not isPlayerAccount() or cache is None or cache.waitForSync or not cache.isSynced():
+                self.status['status']='paused'; return
+            start=time.time(); self.status['status']='building'
+            while self.index<len(self.tasks) and time.time()-start<0.015:
+                cat,key=self.tasks[self.index]; self.index+=1
+                if (cat,key) in self.rows:continue
+                try:
+                    row=enrich_row(cache.items,cat,key,self.folder)
+                    json.dumps(row,allow_nan=False)
+                except Exception as exc:
+                    row={'status':'unavailable','field_errors':{'row':type(exc).__name__}}
+                self.rows[(cat,key)]=row; self.batch.append((cat,key,row))
+                if len(self.batch)>=16:break
+            self.flush()
+            pct=int(100.0*self.index/max(1,len(self.tasks)))
+            self.status.update(processed=self.index,percent=pct,current_category=self.tasks[self.index][0] if self.index<len(self.tasks) else None,elapsed_seconds=int(time.time()-self.started),last_progress_at=time.time())
+            if self.index==len(self.tasks):
+                self.finish(); return
+            now=time.time()
+            if pct>=self.last_pct+5 or now-self.last_notice>=60:
+                self.notify('Additional details %s%% (%s/%s). %s. Progress saved.'%(pct,self.index,len(self.tasks),self.status['current_category']))
+                self.last_notice=now; self.last_pct=pct
+            self.callback=BigWorld.callback(0.1,self.tick)
+        except Exception as exc:
+            self.status.update(status='error',error=type(exc).__name__); self.done=True; self.owner.report_error(exc); self.notify('Additional detail extraction failed. Base catalogue retained.',True)
+    def finish(self):
+        counts={}; files={}
+        for cat in self.CATS:
+            rows={key:row for (c,key),row in self.rows.items() if c==cat}
+            counts[cat]={s:sum(r.get('status')==s for r in rows.values()) for s in ('ok','partial','unavailable')}
+            path=os.path.join(self.folder,cat+'.json')
+            atomic_write(path,dict(self.identity,category=cat,rows=rows)); files[cat]={'count':len(rows),'sha256':digest_file(path)}
+        bad=sum(x['partial']+x['unavailable'] for x in counts.values())
+        self.status.update(status='partial' if bad else 'complete',percent=100,category_counts=counts,files=files,unavailable_or_partial=bad)
+        atomic_write(os.path.join(self.folder,'manifest.json'),self.status)
+        self.done=True
+        self.notify('Additional details finished: %s records, %s with warnings. Base catalogue retained.'%(len(self.rows),bad),bool(bad))
+        if self.owner.sections:self.owner.write_diagnostics()
+    def stop(self):
+        if self.callback is not None:
+            BigWorld.cancelCallback(self.callback); self.callback=None
+        if self.folder and not self.done:
+            self.flush(); self.status['status']='interrupted'
+
+
+_inventory_stock_005 = inventory_stock
+inventory_stock = specialist_stock
+
+# Only post-battle personal and common results; no opponent identities or chat.
+# Explicitly selected personal result fields; no opponent identities or chat.
+BATTLE_FIELDS = set(('credits originalCredits factualCredits subtotalCredits eventCredits eventCreditsList premiumCredits creditsToDraw creditsPenalty creditsContribution creditsContributionIn creditsContributionOut creditsReplay originalPremSquadCredits premiumCreditsFactor100 premiumPlusCreditsFactor100 appliedPremiumCreditsFactor100 wotPlusProBoostCreditsFactor100 orderCreditsFactor100 xp originalXP factualXP subtotalXP premiumXP eventXP eventXPList dailyXPFactor10 premiumXPFactor100 premiumPlusXPFactor100 appliedPremiumXPFactor100 additionalXPFactor10 orderXPFactor100 freeXP originalFreeXP factualFreeXP subtotalFreeXP premiumFreeXP eventFreeXP eventFreeXPList orderFreeXPFactor100 tmenXP originalTmenXP originalTMenXP factualTMenXP subtotalTMenXP premiumTmenXPFactor100 appliedPremiumTmenXPFactor100 xpByTmen damageDealt damageReceived damageBlockedByArmor damageAssistedRadio damageAssistedTrack damageAssistedStun kills shots directHits directEnemyHits piercings piercingEnemyHits spotted deathReason deathCount mileage lifeTime team typeCompDescr repair autoRepairCost autoLoadCost autoEquipCost autoEquipBoostersCost autoRepair autoLoad autoEquip capturePoints droppedCapturePoints arenaTypeID duration winnerTeam bonusType gameplayType guiType finishReason arenaCreateTime').split())
+
+def result_projection(raw):
+    if not isinstance(raw,dict):
+        raise ValueError('Expected battle results mapping')
+    def project(d):
+        out = {}
+        if not isinstance(d,dict):
+            return out
+        for k,v in d.items():
+            if k in BATTLE_FIELDS:
+                try: out[k]=plain(v)
+                except Exception: pass
+        return out
+    personal=raw.get('personal',{})
+    rows={}
+    if isinstance(personal,dict):
+        for k,v in personal.items():
+            key=name_text(k)
+            if key.isdigit() or key=='avatar':
+                value=project(v)
+                if value: rows[key]=value
+        if not rows and project(personal): rows['unidentified']=project(personal)
+    common=raw.get('common',{})
+    return {'common':project(common),'personal':rows,'bots_present': bool(common['bots']) if isinstance(common,dict) and 'bots' in common else None}
+
+def account_hash(dbid):
+    import hashlib
+    if dbid is None or not name_text(dbid).isdigit() or int(dbid)<=0: return None
+    return hashlib.sha256(('wot-local:'+name_text(dbid)).encode('utf-8')).hexdigest()[:24]
+
+def battle_id_text(value):
+    if value is None or not name_text(value).isdigit() or int(value)<=0: return None
+    return name_text(value)
+
+def battle_mode(data):
+    # Conservative: a mixed/bot match must never be included in pure PvP.
+    code=data.get('common',{}).get('bonusType')
+    if code==46 or data.get('bots_present') is True: return 'ai_or_mixed'
+    if code==1 and data.get('bots_present') is not True: return 'random_pvp'
+    if code in (0, None): return 'unknown'
+    return 'other_mode'
+
+
+# Only public arena identity and the local player's team/vehicle.
+# No opponent information, coordinates, movement, or battle commands.
+CONTEXT_INTERVAL = 2.0
+CONTEXT_STALE_AFTER = 10.0
+
+
+def context_int(value, positive=False):
+    if isinstance(value,integer_types) and not isinstance(value,bool) and value >= (1 if positive else 0):
+        return int(value)
+    return None
+
+
+def context_attr(obj,name):
+    try: return getattr(obj,name)
+    except Exception: return None
+
+
+def context_text(value):
+    if value is None: return None
+    try: return name_text(value) or None
+    except Exception: return None
+
+
+def avatar_context(player):
+    arena=context_attr(player,'arena')
+    arena_id=battle_id_text(context_attr(player,'arenaUniqueID'))
+    map_id=context_int(context_attr(player,'arenaTypeID'),True)
+    arena_type=context_attr(arena,'arenaType')
+    # The exact arena type ID keys the catalogue, not the geometry ID.
+    if map_id is not None:
+        try:
+            import ArenaType
+            cached=ArenaType.g_cache.get(map_id)
+            if cached is not None: arena_type=cached
+        except Exception: pass
+    team=context_int(context_attr(player,'team'),True)
+    if team is None:
+        # Own vehicle only, never enumerate other players.
+        try: team=context_int(arena.vehicles[player.playerVehicleID].get('team'),True)
+        except Exception: pass
+    vehicle_id=context_int(context_attr(context_attr(context_attr(player,'vehicleTypeDescriptor'),'type'),'compactDescr'),True)
+    bonus=context_int(context_attr(player,'arenaBonusType'))
+    if bonus is None: bonus=context_int(context_attr(arena,'bonusType'))
+    gui=context_int(context_attr(player,'arenaGuiType'))
+    if gui is None: gui=context_int(context_attr(arena,'guiType'))
+    return {'battle_id':arena_id,'map_id':map_id,'arena_type_id':map_id,
+            'geometry_id':context_int(context_attr(arena_type,'geometryID'),True),
+            'geometry_name':context_text(context_attr(arena_type,'geometryName')),
+            'map_name':context_text(context_attr(arena_type,'name')),
+            'gameplay_id':context_int(context_attr(arena_type,'gameplayID')),
+            'gameplay_name':context_text(context_attr(arena_type,'gameplayName')),
+            'bonus_type':bonus,'gui_type':gui,'team':team,'vehicle_id':vehicle_id}
+
+
+
+# Read-only catalogue extension: local descriptor objects only.
+AUDIT_SCHEMA=1
+
+def audit_tree(rows):
+    pool={str(k):r for k,r in rows.items() if isinstance(r.get('level'),integer_types)
+        and 1<=r['level']<=11 and str(r.get('type','')).lower() in
+        ('lighttank','mediumtank','heavytank','at-spg','spg')
+        and all(r.get(k) is False for k in ('isPremium','isCollectible','isSecret'))}
+    todo=[k for k,r in pool.items() if r['level']==1]; seen=set(todo)
+    while todo:
+        k=todo.pop(); r=pool[k]
+        for e in r.get('research_edges') or []:
+            if not isinstance(e,list) or len(e)<2:continue
+            t=str(e[1]); o=pool.get(t)
+            if o and t not in seen and o['nationID']==r['nationID'] and o['level']>r['level']:
+                seen.add(t); todo.append(t)
+    return sorted(seen,key=int)
+
+def audit_raw(obj,names):
+    p=Probe()
+    return {'values':extra_fields(obj,names,p,'raw'),'errors':p.details}
+
+def audit_modules(d):
+    return dict(chassis=d.chassis.compactDescr,engine=d.engine.compactDescr,
+        radio=d.radio.compactDescr,fuelTank=d.fuelTank.compactDescr,
+        turrets=[[t.compactDescr,g.compactDescr] for t,g in d.turrets])
+
+def audit_candidates(d):
+    from itertools import product
+    pools=[sorted(set(m.compactDescr for m in getattr(d.type,n))) for n in ('chassis','engines','radios','fuelTanks')]
+    groups=[sorted(set((t.compactDescr,g.compactDescr) for t in group for g in t.guns)) for group in d.type.turrets]
+    if not groups or any(not x for x in pools+groups):raise Unavailable('Incomplete module combinations')
+    n=1
+    for x in pools+groups:n*=len(x)
+    if n>10000:raise Unavailable('Combination safety limit')
+    return [dict(chassis=c[0],engine=c[1],radio=c[2],fuelTank=c[3],turrets=[list(x) for x in c[4:]]) for c in product(*(pools+groups))]
+
+def audit_allowed(result):
+    if not isinstance(result,(tuple,list)) or not result or not isinstance(result[0],bool):
+        raise Unavailable('Unknown fitting result')
+    return result[0]
+
+def audit_config(stock,wanted,baseline):
+    from items import vehicles
+    from gui.shared.gui_items.Vehicle import Vehicle
+    p=Probe(); row={'modules':wanted,'status':'unavailable','legality':'unverified','baseline_status':baseline}
+    try:
+        original=stock.descriptor.makeCompactDescr()
+        d=vehicles.VehicleDescr(compactDescr=original)
+        if d is stock.descriptor:raise Unavailable('Descriptor not isolated')
+        # These are local descriptor methods, not account action processors.
+        for n in ('chassis','engine','radio','fuelTank'):
+            target=wanted[n]
+            if getattr(d,n).compactDescr==target:continue
+            if not audit_allowed(d.mayInstallComponent(target)):
+                return dict(row,status='rejected',legality='native_rejected',component=n)
+            d.installComponent(target)
+        for i,(t,g) in enumerate(wanted['turrets']):
+            if [x.compactDescr for x in d.turrets[i]]==[t,g]:continue
+            if not audit_allowed(d.mayInstallTurret(t,g,i)):
+                return dict(row,status='rejected',legality='native_rejected',component='turret_gun')
+            d.installTurret(t,g,i)
+        if audit_modules(d)!=wanted or stock.descriptor.makeCompactDescr()!=original:
+            raise Unavailable('Descriptor identity changed unexpectedly')
+        row['physics']=audit_raw(d,'physics')
+        row['chassis']=audit_raw(d.chassis,'weight maxLoad maxWeight loadLimit terrainResistance terrainResistanceRotation rotationSpeed shotDispersionFactors')
+        row['hull']=audit_raw(d.hull,'weight armor')
+        row['turret']=audit_raw(d.turret,'armor circularVisionRadius rotationSpeed yawLimits')
+        row['gun']=audit_raw(d.gun,'shotDispersionFactors shotDispersionAngle aimingTime reloadTime clip burst autoReload yawLimits pitchLimits maxAmmo')
+        row['shots']=[]
+        for i,s in enumerate(d.gun.shots):
+            shot=extra_fields(s,'speed gravity maxDistance nominalMaxDistance piercingPower defaultPortion',p,'shot.%s'%i)
+            shot['shell_id']=p.get('shot.%s.id'%i,lambda:s.shell.compactDescr)
+            shot['shell']=audit_raw(s.shell,'kind caliber damage piercingPower')
+            row['shots'].append(shot)
+        row['standard_shell_status']='not_verified'
+        v=Vehicle(strCompactDescr=d.makeCompactDescr())
+        if v is stock or v.descriptor is stock.descriptor or v.intCD!=stock.intCD or audit_modules(v.descriptor)!=wanted:
+            raise Unavailable('Independent GUI vehicle identity mismatch')
+        if getattr(v,'isInInventory',False) or any(v.optDevices.installed):
+            raise Unavailable('Unexpected live inventory or equipment')
+        row['parameters']=parameter_map(v,p,'configuration')
+        row['crew_bonuses']=p.get('crew_bonuses',lambda:v.bonuses)
+        row['legality']='native_component_checks_passed_load_unverified'
+        row['status']='calculated'
+        if wanted==audit_modules(stock.descriptor):
+            expected=parameter_map(stock,p,'stock_baseline')
+            fields=('vehicleWeight','maxHealth','enginePower','circularVisionRadius','avgDamagePerMinute','shotDispersionAngle','invisibilityStillFactor')
+            compared=[k for k in fields if k in expected and k in row['parameters']]
+            diff=[k for k in compared if expected[k]!=row['parameters'][k]]
+            row['baseline_comparison']={'compared':compared,'different':diff}
+            row['baseline_status']='matched' if len(compared)==len(fields) and not diff else 'different_or_incomplete'
+    except Exception as exc:
+        row.update(status='unavailable',error=type(exc).__name__+': '+name_text(exc)[:200])
+    row['field_errors']=p.details
+    return row
+
+class ConfigurationAudit(object):
+    def __init__(self,owner):
+        self.owner=owner;self.callback=None;self.folder=None;self.done=False
+        self.status={'status':'waiting'};self.index=0;self.current=None;self.files={};self.counts={};self.last_notice=0
+    def ensure(self):
+        base=self.owner.catalogue
+        if self.done or self.callback is not None or not self.owner.active or base.status.get('status') not in ('complete','reused') or not self.owner.enrichment.done:return
+        if self.folder is None:
+            self.folder=os.path.join(base.folder,'configuration-audit-v1')
+            if not os.path.isdir(self.folder):os.makedirs(self.folder)
+            self.identity={'schema':AUDIT_SCHEMA,'game_version':base.version,'collector_version':VERSION,'base_checksums':{k:v['sha256'] for k,v in base.status['files'].items()}}
+            self.rows=base.load_category(base.folder,'vehicles',base.status['files']['vehicles'])['rows']
+            self.keys=audit_tree(self.rows)
+            if not self.keys:raise Unavailable('No researchable vehicles identified')
+            self.status=dict(self.identity,status='building',folder=self.folder,relative_path=os.path.relpath(self.folder,base.root),total_vehicles=len(self.keys),processed_vehicles=0)
+            for k in self.keys:
+                path=os.path.join(self.folder,k+'.json')
+                try:
+                    r=read_json(path)
+                    if r.get('identity')!=self.identity or str(r.get('vehicle_id'))!=k or r.get('finished') is not True:continue
+                    counts=r['counts']
+                    if counts.get('candidates')!=len(r.get('configurations',[])):continue
+                    self.files[k]={'sha256':digest_file(path),'count':counts['candidates']}
+                    for n,v in counts.items():self.counts[n]=self.counts.get(n,0)+v
+                except Exception:continue
+            self.status.update(recovered=len(self.files),counts=dict(self.counts))
+            self.owner.enrichment.notify('Configuration audit: %s vehicles; %s recovered.'%(len(self.keys),len(self.files)))
+        self.callback=BigWorld.callback(0.1,self.tick)
+    def finish_vehicle(self):
+        k=self.keys[self.index];r=self.current
+        counts={'candidates':len(r['configurations']),'vehicle_errors':int(bool(r.get('error')))}
+        for c in r['configurations']:
+            label=c.get('status','unavailable');counts[label]=counts.get(label,0)+1
+            if c.get('legality')=='native_component_checks_passed_load_unverified':counts['load_unverified']=counts.get('load_unverified',0)+1
+        r.update(identity=self.identity,vehicle_id=int(k),finished=True,counts=counts)
+        r.pop('pending',None);r.pop('baseline',None)
+        path=os.path.join(self.folder,k+'.json');atomic_write(path,r)
+        self.files[k]={'sha256':digest_file(path),'count':counts['candidates']}
+        for n,v in counts.items():self.counts[n]=self.counts.get(n,0)+v
+        self.current=None;self.index+=1
+    def tick(self):
+        self.callback=None
+        try:
+            from helpers import isPlayerAccount
+            cache=self.owner.cache
+            if not self.owner.active:return
+            if not isPlayerAccount() or cache is None or cache.waitForSync or not cache.isSynced():
+                self.status['status']='paused';return
+            self.status['status']='building';start=time.time();work=0
+            while self.index<len(self.keys) and work<3 and time.time()-start<0.015:
+                k=self.keys[self.index]
+                if k in self.files:self.index+=1;continue
+                if self.current is None:
+                    self.current={'configurations':[],'pending':[],'baseline':'not_verified'}
+                    try:
+                        stock=cache.items.getStockVehicle(int(k));d=stock.descriptor
+                        self.current['metadata']={'stock_modules':audit_modules(d),'research_edges':self.rows[k].get('research_edges'),
+                            'turret_gun_groups':[[{'turret':t.compactDescr,'guns':[g.compactDescr for g in t.guns]} for t in group] for group in d.type.turrets],
+                            'type_fields':audit_raw(d.type,'level tags crewRoles invisibility speedLimits battleLevels battleTiers matchmakingLevels matchmakingRange balanceLevels'),
+                            'matchmaking_status':'unverified_native_fields_only'}
+                        self.current['pending']=audit_candidates(d)
+                        base=audit_modules(d);self.current['pending'].sort(key=lambda c:c!=base)
+                    except Exception as exc:self.current['error']=type(exc).__name__+': '+name_text(exc)[:200]
+                if self.current['pending']:
+                    wanted=self.current['pending'].pop(0)
+                    try:
+                        stock=cache.items.getStockVehicle(int(k))
+                        r=audit_config(stock,wanted,self.current['baseline'])
+                        if 'baseline_comparison' in r:self.current['baseline']=r['baseline_status']
+                    except Exception as exc:r={'modules':wanted,'status':'unavailable','legality':'unverified','error':type(exc).__name__}
+                    self.current['configurations'].append(r);work+=1
+                if not self.current['pending']:self.finish_vehicle()
+            self.status.update(processed_vehicles=len(self.files),counts=dict(self.counts),last_progress_at=time.time(),percent=int(100.0*len(self.files)/len(self.keys)))
+            if self.index>=len(self.keys):
+                self.status.update(status='partial',collection_finished=True,files=self.files)
+                atomic_write(os.path.join(self.folder,'manifest.json'),self.status);self.done=True
+                self.owner.enrichment.notify('Configuration audit finished: %s vehicles, %s calculated configurations. See diagnostics.'%(len(self.files),self.counts.get('calculated',0)))
+                if self.owner.sections:self.owner.write_diagnostics()
+                self.owner.publish(self.owner.status,'configuration_audit_finished');return
+            if time.time()-self.last_notice>=60:
+                self.last_notice=time.time()
+                self.owner.enrichment.notify('Configuration audit %s%% (%s/%s vehicles).'%(self.status['percent'],len(self.files),len(self.keys)))
+            self.callback=BigWorld.callback(0.1,self.tick)
+        except Exception as exc:
+            self.status.update(status='error',error=type(exc).__name__+': '+name_text(exc)[:200]);self.done=True;self.owner.report_error(exc)
+    def stop(self):
+        if self.callback is not None:BigWorld.cancelCallback(self.callback);self.callback=None
+        if not self.done and self.folder:self.status['status']='interrupted'
+
+
+class Connector(object):
+    def __init__(self):
+        self.active = False
+        self.periodic = None
+        self.pending = None
+        self.events = []
+        self.hook_history = {}
+        self.last_selected = None
+        self.game_state = 'starting'
+        self.cache = None
+        self.current = None
+        self.data = None
+        self.errors = {}
+        self.revision = 0
+        self.history = []
+        self.last_valid = None
+        self.session = '%s-%s' % (int(time.time()), os.getpid())
+        self.last_log = None
+        self.status = 'starting'
+        self.reason = 'startup'
+        self.path = None
+        self.sections = {}
+        self.full_at = None
+        self.full_revision = 0
+        self.full_status = 'waiting'
+        self.full_pending = None
+        self.config_history = []
+        self.last_config = None
+        self.was_outside = False
+        self.battle_events = []
+        self.battle_hook = None
+        self.catalogue = Catalogue(self)
+        self.enrichment = Enrichment(self)
+        self.configuration_audit = ConfigurationAudit(self)
+        self.extra_hooks = []
+        self.results_service = None
+        self.last_battle_config = None
+        self.result_count = 0
+        self.history_errors = []
+        self.battle_capture_status = 'awaiting_battle'
+        self.cached_game_version = None
+        self.account_key = None
+        self.result_seen=set()
+        self.result_seen_loaded=False
+        self.result_duplicates=0
+        self.battle_config_ids=set()
+        self.context_callback=None
+        self.context_queue=False
+        self.context_ready_id=None
+        self.context_snapshot=None
+        self.context_last_battle=None
+        self.context_transitions=[]
+        self.context_revision=0
+        self.context_error=None
+
+    def persist(self, name, row):
+        try:
+            record = dict(row,session=self.session,connector_version=VERSION,game_version=self.game_version(),recorded_at=time.time())
+            # Scope financial records to the actual account if its local ID is available.
+            if self.account_key is not None:
+                record['account_key'] = self.account_key
+            append_record(os.path.join(os.path.dirname(PORTABLE_EXPORT),'history',name+'.jsonl'),record)
+            return True
+        except Exception as exc:
+            self.history_errors.append(type(exc).__name__+': '+name_text(exc)[:200])
+            self.history_errors = self.history_errors[-10:]
+            return False
+
+    def bind_extra(self):
+        from PlayerEvents import g_playerEvents
+        for obj,name,cb in [(g_playerEvents,'onAvatarReady',self.on_avatar_ready),(g_playerEvents,'onEnqueued',self.on_enqueued),(g_playerEvents,'onDequeued',self.on_dequeued),(g_playerEvents,'onAvatarBecomePlayer',self.on_context_avatar),(g_playerEvents,'onAccountBecomePlayer',self.on_context_account)]:
+            if any(label==name for ev,callback,label in self.extra_hooks):
+                continue
+            try:
+                event = getattr(obj,name)
+                event += cb
+                self.extra_hooks.append((event,cb,name))
+                self.hook_history.setdefault(name,{})['last_status']='registered'
+            except Exception as exc:
+                self.hook_history.setdefault(name,{})['last_status']=type(exc).__name__
+        try:
+            from helpers import dependency
+            from skeletons.gui.battle_results import IBattleResultsService
+            svc = dependency.instance(IBattleResultsService)
+            if svc is not None and svc is not self.results_service:
+                for ev,cb,label in list(self.extra_hooks):
+                    if label=='onResultPosted':
+                        ev -= cb
+                        self.extra_hooks.remove((ev,cb,label))
+                event = svc.onResultPosted
+                event += self.on_result_posted
+                self.extra_hooks.append((event,self.on_result_posted,'onResultPosted'))
+                self.results_service=svc
+                self.hook_history.setdefault('onResultPosted',{})['last_status']='registered'
+        except Exception as exc:
+            self.hook_history.setdefault('onResultPosted',{})['last_status']=type(exc).__name__
+
+    def on_dequeued(self,*args,**kwargs):
+        self.note_event('onDequeued')
+        self.context_queue=False
+        self.update_context('onDequeued')
+        # Keep the queue snapshot until avatar-ready: dequeue may mean battle found.
+
+    def on_enqueued(self,*args,**kwargs):
+        try:
+            self.note_event('onEnqueued')
+            self.context_queue=True
+            self.context_ready_id=None
+            self.update_context('onEnqueued')
+            self.last_battle_config=None
+            from helpers import isPlayerAccount
+            if not isPlayerAccount() or self.current is None or not self.current.isPresent(): return
+            veh=self.current.item
+            p=Probe()
+            config={'intCD':veh.intCD,'modules':{a:item_row(getattr(veh,a),p,a) for a in ('gun','turret','engine','chassis','radio','fuelTank')}}
+            for a in ('optDevices','shells','consumables','battleBoosters'):
+                config[a]=p.get(a,lambda a=a:installed(veh,a,p,a))
+            config['crew']={name_text(tm.invID):crew_row(tm,p,'crew.%s'%tm.invID) for _,tm in veh.crew if tm is not None}
+            self.last_battle_config={'sampled_at':time.time(),'configuration':config,'field_errors':p.errors,'source':'queue_entry','account_key':self.account_key}
+            self.persist('configurations',{'kind':'queue_entry','snapshot':self.last_battle_config})
+        except Exception as exc: self.report_error(exc)
+
+    def on_avatar_ready(self,*args,**kwargs):
+        try:
+            self.note_event('onAvatarReady')
+            self.context_ready_id=battle_id_text(context_attr(BigWorld.player(),'arenaUniqueID'))
+            self.context_queue=False
+            self.update_context('onAvatarReady')
+            try:
+                import BattleReplay
+                playing=BattleReplay.g_replayCtrl.isPlaying
+                if playing() if callable(playing) else playing: return
+            except Exception: pass
+            player=BigWorld.player()
+            arena_id=battle_id_text(getattr(player,'arenaUniqueID',None))
+            if not arena_id: return
+            if arena_id in self.battle_config_ids: return
+            cfg=self.last_battle_config
+            self.last_battle_config=None
+            actual=None
+            try: actual=player.vehicleTypeDescriptor.type.compactDescr
+            except Exception: pass
+            status='unavailable'
+            if cfg and cfg.get('source')=='queue_entry' and cfg.get('account_key')==self.account_key and 0<=time.time()-cfg.get('sampled_at',0)<=1800:
+                if actual is None: status='candidate_not_verified'
+                elif cfg['configuration']['intCD']==actual: status='queue_vehicle_matched'
+                else: cfg=None
+            else: cfg=None
+            if self.persist('configurations',{'kind':'battle_start_candidate','battle_id':arena_id,'configuration':cfg,'configuration_status':status,'avatar_vehicle_id':actual}):
+                self.battle_config_ids.add(arena_id)
+        except Exception as exc: self.report_error(exc)
+
+    def on_context_avatar(self,*args,**kwargs):
+        self.note_event('onAvatarBecomePlayer')
+        self.context_queue=False
+        self.update_context('onAvatarBecomePlayer')
+
+    def on_context_account(self,*args,**kwargs):
+        self.note_event('onAccountBecomePlayer')
+        self.context_queue=False
+        self.context_ready_id=None
+        self.update_context('onAccountBecomePlayer',force_state='garage')
+
+    def context_tick(self):
+        self.context_callback=None
+        if not self.active: return
+        try: self.update_context('poll')
+        finally:
+            if self.active: self.context_callback=BigWorld.callback(CONTEXT_INTERVAL,self.context_tick)
+
+    def update_context(self,source,force_state=None):
+        if not self.path: return
+        try:
+            now=time.time()
+            state=force_state
+            fields=avatar_context(None)
+            error=None
+            if state is None:
+                try:
+                    from helpers import isPlayerAccount,isPlayerAvatar
+                    if isPlayerAvatar():
+                        self.context_queue=False
+                        # Avoid switching the desktop advisor to a replay.
+                        try:
+                            import BattleReplay
+                            playing=BattleReplay.g_replayCtrl.isPlaying
+                            playing=playing() if callable(playing) else playing
+                        except Exception:
+                            playing=None
+                        if playing is None: state='replay_status_unknown'
+                        elif playing: state='replay'
+                        else:
+                            fields=avatar_context(BigWorld.player())
+                            state='in_battle' if fields['battle_id'] and fields['battle_id']==self.context_ready_id else 'battle_loading'
+                    elif isPlayerAccount():
+                        state='matchmaking' if self.context_queue else 'garage'
+                        self.context_ready_id=None
+                    else:
+                        state='outside_garage'
+                        self.context_ready_id=None
+                except Exception as exc:
+                    state='unknown'; fields=avatar_context(None); error=type(exc).__name__
+            if state in ('garage','matchmaking'):
+                try:
+                    if self.current is not None and self.current.isPresent():
+                        fields['vehicle_id']=context_int(self.current.item.intCD,True)
+                except Exception: pass
+            map_ready=bool(state in ('battle_loading','in_battle') and fields['battle_id'] and (fields['map_id'] is not None or fields['geometry_name']))
+            core=dict(fields,state=state,map_ready=map_ready,team_ready=bool(map_ready and fields['team'] is not None),error=error)
+            changed=core!=self.context_snapshot
+            if changed:
+                self.context_revision+=1
+                self.context_snapshot=core
+                self.context_transitions.append(dict(core,at=now,source=source,revision=self.context_revision))
+                self.context_transitions=self.context_transitions[-24:]
+            if map_ready:
+                self.context_last_battle=dict(core,observed_at=now)
+            payload=dict(core,schema=1,connector_version=VERSION,session=self.session,game_version=self.game_version(),account_key=self.account_key,heartbeat_at=now,stale_after_seconds=CONTEXT_STALE_AFTER,revision=self.context_revision,source=source,last_battle=self.context_last_battle,recent_transitions=self.context_transitions)
+            atomic_write(os.path.join(os.path.dirname(self.path),'battle_context.json'),payload)
+            self.context_error=None
+        except Exception as exc:
+            self.context_error=type(exc).__name__
+            self.report_error(exc)
+
+    def capture_result(self,raw,arena_id,source):
+        import hashlib
+        arena_id=battle_id_text(arena_id or raw.get('arenaUniqueID'))
+        if not arena_id: raise Unavailable('Battle identifier not accessible')
+        data=result_projection(raw)
+        if not data['personal']: raise Unavailable('Personal battle results not accessible')
+        # Keep distinct revisions, but suppress repeated identical payloads.
+        if self.account_key is None:
+            try: self.account_key=account_hash(getattr(BigWorld.player(),'databaseID',None))
+            except Exception: pass
+        key=(self.account_key or 'unknown',arena_id)
+        digest=hashlib.sha256(json.dumps(data,sort_keys=True,ensure_ascii=True,allow_nan=False).encode('ascii')).hexdigest()
+        if not self.result_seen_loaded:
+            self.result_seen_loaded=True
+            path=os.path.join(os.path.dirname(PORTABLE_EXPORT),'history','battle_results.jsonl')
+            try:
+                with open(path,'rb') as f:
+                    for line in f:
+                        try:
+                            r=json.loads(line)
+                            if r.get('payload_sha256'): self.result_seen.add((r.get('account_key') or 'unknown',name_text(r['battle_id']),r['payload_sha256']))
+                        except Exception: pass
+            except IOError: pass
+        marker=key+(digest,)
+        if marker in self.result_seen:
+            self.result_duplicates+=1
+            return
+        if self.persist('battle_results',{'kind':'completed_result','battle_id':arena_id,'data':data,'source':source,'mode':battle_mode(data),'payload_sha256':digest,'deduplication':'account_key + battle_id; distinct revisions retained'}):
+            self.result_seen.add(marker)
+            self.result_count+=1
+            self.battle_capture_status='result_observed'
+        else: self.battle_capture_status='write_failed'
+
+    def on_result_posted(self,reusable,statsCtrl,*args):
+        try:
+            self.note_event('onResultPosted')
+            result=statsCtrl.getResults()
+            raw=getattr(result,'results',result)
+            self.capture_result(raw,getattr(reusable,'arenaUniqueID',None),'client_result_posted')
+            if self.sections: self.write_diagnostics()
+        except Exception as exc:
+            self.battle_capture_status='partial: '+type(exc).__name__
+            self.report_error(exc)
+
+    def start(self):
+        if self.active:
+            return
+        self.path = output_path()
+        self.active = True
+        self.account_key = None
+        self.publish('starting', 'startup')
+        self.update_context('startup',force_state='starting')
+        self.context_callback=BigWorld.callback(0.2,self.context_tick)
+        try:
+            from PlayerEvents import g_playerEvents
+            self.battle_hook = g_playerEvents.onBattleResultsReceived
+            self.battle_hook += self.on_battle_results
+        except Exception:
+            self.battle_hook = None
+        self.bind_extra()
+        self.periodic = BigWorld.callback(1.0, self.tick)
+        log('Started v' + VERSION)
+
+    def bind(self, obj, name, callback):
+        # Events may be cleared by the game during garage teardown; polling
+        # still runs even when events are unavailable.
+        event = getattr(obj, name, None)
+        if event is None:
+            self.hook_history.setdefault(name, {})['last_status'] = 'unavailable'
+            return
+        if any(old is event for old, cb, label in self.events):
+            return
+        event += callback
+        self.events.append((event, callback, name))
+        entry = self.hook_history.setdefault(name, {})
+        entry['last_status'] = 'registered'
+        entry['registered_at'] = time.time()
+        entry['registrations'] = entry.get('registrations',0)+1
+
+    def unbind(self):
+        for event, callback, name in self.events:
+            try:
+                event -= callback
+            except Exception:
+                pass
+        self.events = []
+
+    def request(self, reason):
+        if not self.active:
+            return
+        self.reason = reason
+        if self.pending is None:
+            self.pending = BigWorld.callback(DEBOUNCE, self.event_tick)
+
+    def on_battle_results(self, *args, **kwargs):
+        if not self.active:
+            return
+        self.battle_events.append({'at':time.time(),'argument_types':[type(a).__name__ for a in args], 'argument_count':len(args)})
+        self.battle_events = self.battle_events[-30:]
+        self.persist('battle_notices',self.battle_events[-1])
+        # Some builds deliver a full mapping with the notice; otherwise replay
+        # import and the normal result-posted hook provide the fallback.
+        for candidate in list(args)+list(kwargs.values()):
+            if isinstance(candidate,dict) and 'personal' in candidate and 'common' in candidate:
+                try: self.capture_result(candidate,candidate.get('arenaUniqueID'),'client_result_notice')
+                except Exception as exc: self.report_error(exc)
+        self.request('battle_results_notice')
+        if self.sections:
+            try:
+                self.write_diagnostics()
+            except Exception as exc:
+                self.report_error(exc)
+
+    def note_event(self,name):
+        e = self.hook_history.setdefault(name,{})
+        e['calls'] = e.get('calls',0)+1
+        e['last_called_at'] = time.time()
+
+    def on_sync(self, *args, **kwargs):
+        self.note_event('onSyncCompleted')
+        self.request('inventory_sync')
+
+    def on_vehicle(self, *args, **kwargs):
+        self.note_event('onChanged')
+        self.request('vehicle_changed')
+
+    def event_tick(self):
+        self.pending = None
+        if self.active:
+            self.refresh(self.reason)
+
+    def tick(self):
+        self.periodic = None
+        if not self.active:
+            return
+        try:
+            self.refresh('periodic')
+        finally:
+            if self.active:
+                self.periodic = BigWorld.callback(INTERVAL, self.tick)
+
+    def refresh(self, reason):
+        try:
+            # Import only after the game has had a chance to initialise.
+            from helpers import dependency, isPlayerAccount
+            from skeletons.gui.shared import IItemsCache
+            from CurrentVehicle import g_currentVehicle
+            if not isPlayerAccount():
+                self.was_outside = True
+                try:
+                    from helpers import isPlayerAvatar
+                    self.game_state = 'in_battle' if isPlayerAvatar() else 'outside_garage'
+                except Exception:
+                    self.game_state = 'outside_garage'
+                self.full_status = 'stale' if self.sections else 'waiting'
+                self.unbind()
+                self.cache = self.current = None
+                self.publish('not_in_garage', reason)
+                return
+            cache = dependency.instance(IItemsCache)
+            if cache is None or cache.waitForSync or not cache.isSynced():
+                self.full_status = 'stale' if self.sections else 'waiting'
+                self.game_state = 'waiting_for_sync'
+                self.publish('waiting_for_sync', reason)
+                return
+            if cache is not self.cache or g_currentVehicle is not self.current:
+                self.unbind()
+                self.cache, self.current = cache, g_currentVehicle
+            for obj, name, cb in [(cache, 'onSyncCompleted', self.on_sync),
+                                  (g_currentVehicle, 'onChanged', self.on_vehicle)]:
+                try:
+                    self.bind(obj, name, cb)
+                except Exception as exc:
+                    self.hook_history.setdefault(name,{})['last_status'] = type(exc).__name__  # polling remains available.
+            self.bind_extra()
+            try:
+                dbid = getattr(BigWorld.player(),'databaseID',None)
+                if dbid:
+                    import hashlib
+                    key = hashlib.sha256(('wot-local:'+name_text(dbid)).encode('utf-8')).hexdigest()[:24]
+                    if self.account_key is not None and key != self.account_key:
+                        self.data = None
+                        self.last_battle_config = None
+                        self.last_config = None
+                    self.account_key = key
+            except Exception:
+                pass
+            data, errors = collect(cache, g_currentVehicle)
+            if self.was_outside: self.last_battle_config=None
+            self.game_state = 'garage' if data['selected_tank'] is not None else 'garage_selection_unavailable'
+            if data['selected_tank'] is not None:
+                self.last_selected = data['selected_tank']
+            status = 'partial' if errors or data['selected_tank'] is None else 'ok'
+            self.last_valid = time.time()
+            if data != self.data or errors != self.errors:
+                changed = sorted(k for k in data if self.data is None or data[k] != self.data.get(k))
+                self.revision += 1
+                self.history.append({'revision': self.revision, 'at': self.last_valid,
+                                     'reason': reason, 'changed': changed,
+                                     'data': data, 'field_errors': errors})
+                self.history = self.history[-30:]
+                old = self.data
+                if old is not None:
+                    delta = {k:data[k]-old[k] for k in ('credits','gold','bonds','free_xp') if isinstance(data.get(k),integer_types) and isinstance(old.get(k),integer_types) and data[k]!=old[k]}
+                    if delta:
+                        self.persist('transactions',{'kind':'unclassified_balance_change','delta':delta,'before':{k:old[k] for k in delta},'after':{k:data[k] for k in delta},'revision':self.revision,'reason':reason})
+                    a,b=old.get('selected_tank'),data.get('selected_tank')
+                    if a and b and a['tank_id']==b['tank_id'] and isinstance(a.get('combat_xp'),integer_types) and isinstance(b.get('combat_xp'),integer_types) and a['combat_xp']!=b['combat_xp']:
+                        self.persist('transactions',{'kind':'unclassified_vehicle_xp_change','tank_id':b['tank_id'],'delta':{'combat_xp':b['combat_xp']-a['combat_xp']},'revision':self.revision})
+                self.persist('account_events',self.history[-1])
+                self.data, self.errors = data, errors
+                log('Snapshot revision %d (%s)' % (self.revision, reason))
+            # A full scan is throttled, even when the game emits many events.
+            # Schedule separately so baseline export survives a collector error.
+            if (self.full_at is None or self.was_outside or time.time()-self.full_at >= FULL_INTERVAL) and self.full_pending is None:
+                self.full_pending = BigWorld.callback(0.2, self.full_tick)
+            self.publish(status, reason)
+            try:
+                self.catalogue.ensure()
+                self.catalogue.notify()
+            except Exception as exc:
+                self.catalogue.status.update(status='error',error=type(exc).__name__)
+                self.catalogue.attempted = True
+                self.catalogue.notify(force=True)
+                self.report_error(exc)
+            try:
+                self.enrichment.ensure()
+            except Exception as exc:
+                self.enrichment.status.update(status='error',error=type(exc).__name__)
+                self.enrichment.done=True
+                self.report_error(exc)
+            try:
+                self.configuration_audit.ensure()
+            except Exception as exc:
+                self.configuration_audit.status.update(status='error',error=type(exc).__name__)
+                self.configuration_audit.done=True
+                self.report_error(exc)
+        except Exception as exc:
+            self.report_error(exc)
+            self.publish('error', reason, type(exc).__name__)
+
+    def full_tick(self):
+        self.full_pending = None
+        if not self.active:
+            return
+        try:
+            from helpers import isPlayerAccount
+            if not isPlayerAccount() or self.cache is None or self.cache.waitForSync or not self.cache.isSynced():
+                return
+            self.sections = comprehensive(self.cache.items)
+            self.sections.update(extra_collectors(self.cache.items))
+            self.full_at = time.time()
+            self.full_revision += 1
+            self.full_status = 'partial' if any(s['status'] not in ('ok','empty') for s in self.sections.values()) else 'ok'
+            self.was_outside = False
+            self.record_configuration()
+            log('Full diagnostics revision %d (%s)' % (self.full_revision,self.full_status))
+            self.write_diagnostics()
+            self.publish(self.status, 'diagnostics_updated')
+        except Exception as exc:
+            self.full_status = 'error'
+            self.report_error(exc)
+            self.publish(self.status, 'diagnostic_error', type(exc).__name__)
+
+    def record_configuration(self):
+        selected = (self.data or {}).get('selected_tank')
+        if not selected:
+            return
+        for entry in self.sections.get('garage',{}).get('data') or []:
+            vehicle = entry.get('vehicle') or {}
+            if vehicle.get('intCD') != selected.get('tank_id'):
+                continue
+            config = {k:vehicle.get(k) for k in ('intCD','modules','optDevices','shells','consumables','battleBoosters','crew_slots')}
+            crew = self.sections.get('crew',{}).get('data') or {}
+            config['crew'] = {name_text(s['crew_id']):crew.get(name_text(s['crew_id'])) for s in vehicle.get('crew_slots') or [] if s.get('crew_id') is not None}
+            if config != self.last_config:
+                self.config_history.append({'at':self.full_at,'kind':'garage_configuration_not_battle_linked','configuration':config})
+                self.persist('configurations',self.config_history[-1])
+                self.config_history = self.config_history[-30:]
+                self.last_config = config
+            if not self.last_battle_config or self.last_battle_config.get('source') != 'queue_entry':
+                self.last_battle_config = {'sampled_at':self.full_at,'configuration':config,'source':'garage_scan'}
+            break
+
+    def write_diagnostics(self):
+        atomic_write(os.path.join(os.path.dirname(self.path),'diagnostics.json'), {
+            'connector_version':VERSION,'schema':7,'session':self.session,
+            'sampled_at':self.full_at,'revision':self.full_revision,'status':self.full_status,
+            'account':self.data,'account_field_errors':self.errors,'sections':self.sections,
+            'configuration_history':self.config_history,'configuration_history_limit':30,
+            'battle_results':{'status':self.battle_capture_status,'notices':self.battle_events,'results_observed':self.result_count,'duplicates_suppressed':self.result_duplicates,'result_hook_registered':self.results_service is not None},
+            'catalogue':self.catalogue.status,'enrichment':self.enrichment.status,'configuration_audit':self.configuration_audit.status,'history_errors':self.history_errors,
+            'battle_context':{'current':self.context_snapshot,'last_battle':self.context_last_battle,'revision':self.context_revision,'write_error':self.context_error,'recent_transitions':self.context_transitions},
+            'game_version':self.game_version(), 'game_state':self.game_state,'last_known_selected_tank':self.last_selected,'hook_diagnostics':self.hook_history,
+            'event_hooks':sorted(label for e,cb,label in self.events)})
+
+    def game_version(self):
+        if self.cached_game_version:
+            return self.cached_game_version
+        # Known version metadata only; avoid scanning game directories.
+        try:
+            import ResMgr
+            section = ResMgr.openSection('version.xml')
+            if section is not None:
+                value = section.readString('version')
+                if value:
+                    self.cached_game_version = name_text(value)
+                    return self.cached_game_version
+        except Exception:
+            pass
+        for folder in (os.getcwd(),os.path.dirname(os.getcwd())):
+            try:
+                root = ET.parse(os.path.join(folder,'version.xml')).getroot()
+                for el in root.iter():
+                    if el.tag.lower() in ('version','versionname','clientversion') and el.text and re.search(r'\d+\.\d+\.\d+',el.text):
+                        self.cached_game_version = name_text(el.text.strip())
+                        return self.cached_game_version
+            except Exception:
+                pass
+        return None
+
+    def report_error(self, exc):
+        marker = type(exc).__name__ + ': ' + str(exc)
+        if marker != self.last_log:
+            self.last_log = marker
+            log(marker)
+            traceback.print_exc()
+
+    def publish(self, status, reason, error=None):
+        self.status = status
+        try:
+            atomic_write(self.path, {'connector_version': VERSION, 'schema': 1,
+                                     'session': self.session, 'status': status, 'game_state':self.game_state, 'last_known_selected_tank':self.last_selected,'hook_diagnostics':self.hook_history,
+                                     'heartbeat_at': time.time(), 'game_version':self.game_version(), 'catalogue':self.catalogue.status,'enrichment':self.enrichment.status,'configuration_audit':self.configuration_audit.status,
+                                     'battle_context_revision':self.context_revision,'battle_context_write_error':self.context_error,
+                                     'sampled_at': self.last_valid,
+                                     'revision': self.revision, 'reason': reason,
+                                     'data': self.data, 'field_errors': self.errors,
+                                     'event_hooks': sorted(label for e, cb, label in self.events),
+                                     'error': error, 'history': self.history, 'diagnostics_status': self.full_status, 'diagnostics_sampled_at': self.full_at, 'diagnostics_revision': self.full_revision})
+        except Exception as exc:
+            self.report_error(exc)
+
+    def stop(self):
+        self.active = False
+        try:
+            self.catalogue.stop()
+        except Exception as exc:
+            self.report_error(exc)
+        try:
+            self.enrichment.stop()
+        except Exception as exc:
+            self.report_error(exc)
+        try:
+            self.configuration_audit.stop()
+        except Exception as exc:
+            self.report_error(exc)
+        for ev,cb,label in self.extra_hooks:
+            try:
+                ev -= cb
+            except Exception:
+                pass
+        self.extra_hooks = []
+        for callback_id in (self.pending, self.periodic, self.full_pending, self.context_callback):
+            if callback_id is not None:
+                try:
+                    BigWorld.cancelCallback(callback_id)
+                except Exception:
+                    pass
+        self.pending = self.periodic = self.full_pending = self.context_callback = None
+        self.unbind()
+        if self.battle_hook is not None:
+            try:
+                self.battle_hook -= self.on_battle_results
+            except Exception:
+                pass
+        if self.path:
+            self.game_state = 'stopped'
+            self.context_queue=False
+            self.context_ready_id=None
+            self.update_context('shutdown',force_state='stopped')
+            self.publish('stopped', 'shutdown')
+            if self.sections:
+                self.write_diagnostics()
+
+
+_connector = Connector()
+
+
+def init():
+    try:
+        _connector.start()
+    except Exception as exc:
+        _connector.report_error(exc)
+
+
+def fini():
+    try:
+        _connector.stop()
+    except Exception as exc:
+        _connector.report_error(exc)
