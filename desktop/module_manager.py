@@ -159,6 +159,9 @@ class ModuleManager:
         if not g or g in (self.state['active'],self.state['previous'],self.state['pending'],self.state['trial']): return
         try:
             p=self.generation_path(g); marker=p/'set.json'
+            if not marker.exists() and not marker.is_symlink():
+                if not any(p.iterdir()):p.rmdir()
+                return
             if marker.is_symlink() or marker.stat().st_size>256*1024: return
             raw=json.loads(marker.read_text(encoding='utf-8'))
             if raw.get('schema')!=1 or raw.get('generation')!=g: return
@@ -170,7 +173,7 @@ class ModuleManager:
                 if child.name in names or (child.name.startswith('.qm-') and child.name.endswith('.tmp')):
                     if child.is_file() and not child.is_symlink(): child.unlink()
             if all(x.name=='set.json' for x in p.iterdir()): marker.unlink(); p.rmdir()
-        except (OSError,ValueError,TypeError,KeyError): logging.warning('Could not clean obsolete module set %s',g)
+        except (OSError,ValueError,TypeError,KeyError) as exc: logging.warning('Could not clean obsolete module set %s: %s',g,exc)
     def cleanup(self):
         for p in self.sets.iterdir():
             if GEN.fullmatch(p.name): self.discard(p.name)
