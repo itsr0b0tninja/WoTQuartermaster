@@ -7,22 +7,22 @@
       "game_versions": [
         "2.4.2.0"
       ],
-      "min_desktop": "0.6.4",
-      "release": "connector-v0.0.10",
-      "sha256": "f4f9e340811d8265dc164bf0214d2a4fd212129ff1297e137b168a4b9835cff1",
-      "size": 152938,
-      "url": "https://github.com/itsr0b0tninja/WoTQuartermaster/releases/download/connector-v0.0.10/wot_companion_connector.wotmod",
-      "version": "0.0.10"
+      "min_desktop": "0.6.5",
+      "release": "connector-v0.0.11",
+      "sha256": "9c6a6a86ac26f9ba6d23c01ef513113382662cabd9cdea927ad254bd3d47e7ec",
+      "size": 164001,
+      "url": "https://github.com/itsr0b0tninja/WoTQuartermaster/releases/download/connector-v0.0.11/wot_companion_connector.wotmod",
+      "version": "0.0.11"
     },
     "desktop": {
       "asset": "WoTQuartermaster.exe",
       "channel": "alpha",
       "min_desktop": "0.2.0",
-      "release": "v0.6.4",
-      "sha256": "5f540f6816cb7dad1c38e381f5061b55431947a193058870946a46191f426a45",
-      "size": 55817189,
-      "url": "https://github.com/itsr0b0tninja/WoTQuartermaster/releases/download/v0.6.4/WoTQuartermaster.exe",
-      "version": "0.6.4"
+      "release": "v0.6.5",
+      "sha256": "c47129821cd5cec09871362e80c68a1b8ecd94ad2279c5457a0f5ffd2e21c260",
+      "size": 55820143,
+      "url": "https://github.com/itsr0b0tninja/WoTQuartermaster/releases/download/v0.6.5/WoTQuartermaster.exe",
+      "version": "0.6.5"
     },
     "replay_parser": {
       "asset": "WoT_Quartermaster_Replay_Parser.txt",
@@ -161,7 +161,7 @@
       "version": "0.1.1"
     }
   },
-  "product_version": "0.6.7",
+  "product_version": "0.6.8",
   "retired_modules": [
     "diagnostic"
   ],
