@@ -1,0 +1,184 @@
+"""Version-aware read-only source manager. External observations never override native data."""
+import hashlib, json, logging, os, re, threading, time, urllib.request, urllib.parse
+from pathlib import Path
+from functools import lru_cache
+from module_runtime import atomic_bytes
+MODULE={'id':'data_manager','version':'0.1.1','api':1,'min_core':'0.6.4','dependencies':{}}
+REFERENCE={'schema': 1, 'reviewed_date': '2026-11-28', 'target_client_build': 'v.2.4.2.0 #1007', 'region': 'EU', 'sources': {'crew': 'https://worldoftanks.eu/en/content/guide/game-mechanics-and-achievements/crew-training/', 'transfer': 'https://worldoftanks.eu/en/content/guide/game-mechanics-and-achievements/vehicle-crew/', 'perk_reset': 'https://worldoftanks.eu/en/news/general-news/crew-perks-expansion-2026/', 'equipment': 'https://worldoftanks.eu/en/content/guide/game-mechanics-and-achievements/equipment/', 'consumables': 'https://worldoftanks.eu/en/content/guide/game-mechanics-and-achievements/consumables/', 'purchase': 'https://worldoftanks.eu/en/content/guide/game-mechanics-and-achievements/purchase-and-research-vehicles/', 'garage': 'https://worldoftanks.eu/en/content/docs/release_notes/release-notes-1-20-1/', 'patches': 'https://worldoftanks.eu/en/content/docs/release_notes/', 'current_patch': 'https://worldoftanks.eu/en/content/docs/release_notes/release-notes-2-4-2/', 'matchmaker': 'https://worldoftanks.eu/en/news/general-news/2-4-matchmaker-update/', 'api': 'https://developers.wargaming.net/reference/eu/wot/encyclopedia/vehicles/', 'api_terms': 'https://developers.wargaming.net/documentation/rules/agreement/', 'tanks_gg': 'https://tanks.gg/about'}, 'rules': {'crew_transfer_standard': {'free_remaining_perk_efficiency_pct': 30, 'credits_price_per_member': 20000, 'same_role_remaining_pct': 60, 'changed_role_remaining_pct': 40, 'gold_price_no_penalty_per_member': 200, 'recovery_xp_per_percentage_point': 1000, 'status': 'official baseline, personal quote unknown'}, 'perk_reset': {'first_free': True, 'free_subsequent_xp_retained_pct': 80, 'credits_20000_xp_retained_pct': 90, 'credits_100000_xp_retained_pct': 100, 'order_xp_retained_pct': 100, 'status': 'official guide and native dropSkillsCost agree; separate from vehicle retraining'}, 'garage_slot': {'historical_standard_credits': 250000, 'status': 'official released 1.20.1 price; current exact amount and discounts unverified'}, 'purchase': {'standard_ammo_selectable': True, 'crew_selectable': True, 'garage_slot_selectable': True, 'no_configuration_option': True, 'exact_personal_quote': None}, 'consumables': {'standard_repair_first_aid_cooldown_s': 90, 'improved_repair_first_aid_extinguisher_cooldown_s': 60, 'status': 'official baseline; verify item IDs and exceptions'}, 'matchmaking': {'role_matching_light_tanks': True, 'light_tank_team_limit': 2, 'wheeled_light_matches_wheeled_light': True, 'individual_vehicle_ranges': None, 'status': 'official 2.4 general rules; server-side variability and exact ranges unknown'}, 'barracks': {'historical_price_gold': 300, 'status': 'Gold per standard expansion; exact current quote and pack size must be checked'}}, 'unresolved': ['individual purchase quotes / bundled contents', 'individual crew transfer eligibility and price', 'live garage and barracks quotes', 'complete equipment stacking and upgraded-fit rules', 'consumable special-mode effects and exact cooldown exceptions', 'six artillery aliases', 'exact per-vehicle matchmaking', 'horizontal gun arcs, autoreload and charge timing, alternate wheel speeds and other special mechanics', 'battle results completeness, ordinary PvP economy and early exit', 'rare achievements and loot box diagnostic errors'], 'excluded_perk_ids': ['any', 'armorPatching', 'commander', 'commander_expert', 'commander_sixthSense', 'commander_universalist', 'driver', 'driver_tidyPerson', 'gunner', 'gunner_gunsmith', 'loader', 'radioman', 'radioman_inventor', 'radioman_lastEffort', 'radioman_retransmitter', 'reserved'], 'base_checksums': {'ammunition': '3f03c8ef3038e558528ae9c8c29b06d9e40dca77e6eb960fa5bf14600a07bb4e', 'boosters': 'd38aaa040d80c194581fb7bd08bff3e35c8127c4b0c2155ade2564bafffb9b8f', 'camouflage': '87ae269f8501600cd958c45a9a3ae5f9fe342e5e1d28b1712a68d2d1bcce512d', 'chassis': '269b80a8aff7147ce393ff15fe584941b7743533c1e56fb7181429f5bfb794e1', 'consumables': 'a64086c4427c16e98593d0c630f08284040ac7cd5b3b62ab4a69c62e6a0c6809', 'crew_books': '50cc206723b2be35ba762fb657517df82c8c740f5716ff891b7ef64515de8e60', 'crew_perks': 'e417c8a5f9b6aa54f25478c467fdf4691f7b98cd33abcc91872327f8548ce042', 'engines': '6cd7d29e81c3ac6ab8eee71396df790b51da4c8285bbf599d9b9107dc72ac7c1', 'equipment': '7f1ac3f2bd3798672baf483e91c24a948e9808d45dbaa9a6703d8da431f6f424', 'guns': '0824a00c34815011e7fdaa85464fb501285bbf412faabf2b87120b6e6d068255', 'maps': '834b49fe7943ed1bbf779e7e125e883b821cff053c4898bdfe091febad19b2a7', 'radios': '8bc14975fb40f1d07e99f76b561f1dfbb092cd12b6f8d18aa1ea56e24528fa57', 'styles': 'd73e727f96c8dac2aaf0a0b5b79439cf888974abb2adc57cf156d6a112cadc34', 'turrets': '53e6960d422154a77eaa08319e8dfe8bc194ad287a2dca31e2d676d44f189e92', 'vehicles': '0a1cdc4dd1cf257bf2f0fc5d6d08b7a4baedb4e289d6893be2dc5a7a7e48714e'}, 'active_perks': [{'id': 'commander_coordination', 'name': 'Coordination', 'official_effect_summary_at_100_percent': 'aim speed +12.5%; 15 s after spotting; no stacking'}, {'id': 'commander_eagleEye', 'name': 'Recon', 'official_effect_summary_at_100_percent': 'view range +2%; damaged observation device penalty -20%'}, {'id': 'commander_emergency', 'name': 'Emergency', 'official_effect_summary_at_100_percent': 'crew efficiency bonus +5%; 15 s after enemy damage; no stacking'}, {'id': 'commander_enemyShotPredictor', 'name': 'Sound Detection', 'official_effect_summary_at_100_percent': 'SPG warning delay 0.1 s; shot direction; stun effect -10%'}, {'id': 'commander_holdLine', 'name': 'Hold the Line', 'official_effect_summary_at_100_percent': 'crew efficiency bonus +5%; enemy team ahead by at least 3 vehicles'}, {'id': 'commander_practical', 'name': 'Practicality', 'official_effect_summary_at_100_percent': 'consumable cooldown -15%'}, {'id': 'commander_staySharp', 'name': 'Stay Sharp', 'official_effect_summary_at_100_percent': 'crew efficiency bonus +5% for 15 s after first aid kit; allows kit without injury'}, {'id': 'commander_tutor', 'name': 'Mentor', 'official_effect_summary_at_100_percent': 'crew XP +20%; replacement of incapacitated crew at 65% effectiveness'}, {'id': 'gunner_armorer', 'name': 'Armorer', 'official_effect_summary_at_100_percent': 'damage and penetration spread ±5%; dispersion -1.5%'}, {'id': 'gunner_focus', 'name': 'Concentration', 'official_effect_summary_at_100_percent': 'dispersion -3.5%; stationary for 3 s'}, {'id': 'gunner_loneWolf', 'name': 'Lone Wolf', 'official_effect_summary_at_100_percent': 'dispersion -5%; aiming speed +5%; no allies within 300 m'}, {'id': 'gunner_pointBlast', 'name': 'Point Blank', 'official_effect_summary_at_100_percent': 'maximum penetration +5%; enemy distance under 50 m'}, {'id': 'gunner_quickAiming', 'name': 'Quick Aiming', 'official_effect_summary_at_100_percent': 'aiming and turret traverse speed +2.5%'}, {'id': 'gunner_rancorous', 'name': 'Designated Target', 'official_effect_summary_at_100_percent': 'enemy visibility duration +2 s in gunner viewing area; damaged module identification delay 0.5 s'}, {'id': 'gunner_smoothTurret', 'name': 'Snap Shot', 'official_effect_summary_at_100_percent': 'turret rotation dispersion -7.5%'}, {'id': 'gunner_sniper', 'name': 'Deadeye', 'official_effect_summary_at_100_percent': 'enemy module critical and crew injury chance +3%'}, {'id': 'driver_badRoadsKing', 'name': 'Off-Road Driving', 'official_effect_summary_at_100_percent': 'moderately soft terrain speed loss -5%; soft terrain loss equals resulting value'}, {'id': 'driver_bulletproof', 'name': 'Bulletproof', 'official_effect_summary_at_100_percent': 'crew efficiency bonus +5%; blocked damage exceeds initial HP'}, {'id': 'driver_motorExpert', 'name': 'Engineer', 'official_effect_summary_at_100_percent': 'forward and reverse speed +1 km/h; damaged engine penalty -20%'}, {'id': 'driver_rammingMaster', 'name': 'Controlled Impact', 'official_effect_summary_at_100_percent': 'enemy ram damage +20%; own ram damage -25%; own suspension ram damage -50%'}, {'id': 'driver_reliablePlacement', 'name': 'Reliable Placement', 'official_effect_summary_at_100_percent': 'HE absorption +15%; engine fire chance -15%; suspension damage -15%'}, {'id': 'driver_smoothDriving', 'name': 'Smooth Ride', 'official_effect_summary_at_100_percent': 'moving shot dispersion -4%'}, {'id': 'driver_suspensionRepair', 'name': 'Field Support', 'official_effect_summary_at_100_percent': 'suspension repair speed +15%; ally within 50 m'}, {'id': 'driver_virtuoso', 'name': 'Clutch Braking', 'official_effect_summary_at_100_percent': 'hull traverse speed +5%'}, {'id': 'loader_ammunitionImprove', 'name': 'Ammo Tuning', 'official_effect_summary_at_100_percent': 'minimum damage and penetration +2%'}, {'id': 'loader_desperado', 'name': 'Adrenaline Rush', 'official_effect_summary_at_100_percent': 'reload time -5%; own HP below 25%'}, {'id': 'loader_intuition', 'name': 'Intuition', 'official_effect_summary_at_100_percent': 'loaded shell change time -60%'}, {'id': 'loader_magMastery', 'name': 'Mag Mastery', 'official_effect_summary_at_100_percent': 'magazine reload time -2.5%'}, {'id': 'loader_melee', 'name': 'Close Combat', 'official_effect_summary_at_100_percent': 'reload time -2.5%; enemy within 50 m'}, {'id': 'loader_pedant', 'name': 'Safe Stowage', 'official_effect_summary_at_100_percent': 'ammo rack durability +25%'}, {'id': 'loader_perfectCharge', 'name': 'Perfect Charge', 'official_effect_summary_at_100_percent': 'shell velocity +10%'}, {'id': 'loader_secondChance', 'name': 'Second Chance', 'official_effect_summary_at_100_percent': 'next reload time -2.5% after non-damaging shot'}, {'id': 'radioman_battleTempered', 'name': 'Battle Tempered', 'official_effect_summary_at_100_percent': 'stun effect -7.5% per stun; capped at -30%'}, {'id': 'radioman_expert', 'name': 'Communications Expert', 'official_effect_summary_at_100_percent': 'crew efficiency bonus +2.5%; assistance exceeds initial HP'}, {'id': 'radioman_finder', 'name': 'Situational Awareness', 'official_effect_summary_at_100_percent': 'view range +3%'}, {'id': 'radioman_interference', 'name': 'Jamming', 'official_effect_summary_at_100_percent': 'own spotted duration -1 s'}, {'id': 'radioman_sideBySide', 'name': 'Side By Side', 'official_effect_summary_at_100_percent': 'crew efficiency bonus +2.5%; ally of same class within 50 m'}, {'id': 'radioman_signalInterception', 'name': 'Signal Interception', 'official_effect_summary_at_100_percent': 'spot warning delay -0.75 s'}, {'id': 'radioman_threatSearch', 'name': 'Threat Search', 'official_effect_summary_at_100_percent': 'view range +2% for 5 s after Sixth Sense'}, {'id': 'fireFighting', 'name': 'Firefighting', 'official_effect_summary_at_100_percent': 'fire extinguishing speed +80%; radio operator'}, {'id': 'brotherhood', 'name': 'Brothers in Arms', 'official_effect_summary_at_100_percent': 'crew efficiency bonus +5%; all crew fully trained'}, {'id': 'camouflage', 'name': 'Concealment', 'official_effect_summary_at_100_percent': 'concealment +80%; all crew fully trained'}, {'id': 'repair', 'name': 'Repairs', 'official_effect_summary_at_100_percent': 'repair speed +80%; all crew fully trained'}], 'equipment_family_candidates': {'11257': 'improvedConfiguration', '11513': 'ventilation', '11769': 'rammer', '12025': 'coatedOptics', '12281': 'aimingStabilizer', '12537': 'enhancedAimDrives', '13049': 'enhancedAimDrives', '13305': 'enhancedAimDrives', '13561': 'rammer', '13817': 'rammer', '14073': 'ventilation', '14329': 'ventilation', '14585': 'aimingStabilizer', '14841': 'aimingStabilizer', '15097': 'coatedOptics', '15353': 'coatedOptics', '15865': 'improvedConfiguration', '16121': 'improvedConfiguration', '16377': 'antifragmentationLining', '16633': 'antifragmentationLining', '16889': 'antifragmentationLining', '17145': 'antifragmentationLining', '17401': 'stereoscope', '17657': 'stereoscope', '17913': 'stereoscope', '18169': 'coatedOptics', '18425': 'coatedOptics', '18681': 'coatedOptics', '18937': 'camouflageNet', '19193': 'camouflageNet', '19449': 'ventilation', '19705': 'ventilation', '19961': 'ventilation', '20217': 'grousers', '20473': 'grousers', '20729': 'grousers', '20985': 'rammer', '21241': 'rammer', '21497': 'enhancedAimDrives', '21753': 'enhancedAimDrives', '22009': 'enhancedAimDrives', '22265': 'aimingStabilizer', '22521': 'aimingStabilizer', '22777': 'additInvisibilityDevice', '23033': 'additInvisibilityDevice', '23289': 'additInvisibilityDevice', '23545': 'healthReserve', '23801': 'healthReserve', '24057': 'healthReserve', '24313': 'radioCommunication', '24569': 'rotationMechanism', '24825': 'rotationMechanism', '25081': 'turbocharger', '25337': 'turbocharger', '25593': 'turbocharger', '25849': 'commandersView', '26105': 'improvedSights', '26361': 'improvedSights', '27129': 'improvedConfiguration', '27385': 'improvedConfiguration', '27641': 'rotationMechanism', '27897': 'rotationMechanism', '28153': 'improvedSights', '28409': 'improvedSights', '28665': 'turbocharger', '28921': 'healthReserve', '29177': 'additInvisibilityDevice', '29433': 'additInvisibilityDevice', '29689': 'turbocharger', '29945': 'turbocharger', '30201': 'rotationMechanism', '30457': 'healthReserve', '30713': 'healthReserve', '30969': 'improvedSights', '31225': 'additInvisibilityDevice', '31481': 'stereoscope', '31737': 'camouflageNet', '38649': 'enhancedAimDrives', '38905': 'enhancedAimDrives', '39161': 'enhancedAimDrives', '39417': 'turbocharger', '39673': 'turbocharger', '39929': 'turbocharger', '40185': 'healthReserve', '40441': 'healthReserve', '40697': 'healthReserve', '40953': 'improvedSights', '41209': 'improvedSights', '41465': 'improvedSights'}, 'consumable_candidates': {'1019': {'tags': ['medkit', 'perk_affected', 'premium_equipment'], 'is_for_sale': True, 'built_in': False}, '11771': {'tags': ['trigger', 'avatar'], 'is_for_sale': True, 'built_in': False}, '12283': {'tags': ['trigger', 'avatar'], 'is_for_sale': True, 'built_in': False}, '1275': {'tags': ['perk_affected', 'repairkit'], 'is_for_sale': True, 'built_in': False}, '12795': {'tags': ['trigger', 'avatar'], 'is_for_sale': True, 'built_in': False}, '14331': {'tags': ['trigger', 'avatar'], 'is_for_sale': True, 'built_in': False}, '14843': {'tags': ['trigger', 'avatar'], 'is_for_sale': True, 'built_in': False}, '1531': {'tags': ['perk_affected', 'repairkit', 'premium_equipment'], 'is_for_sale': True, 'built_in': False}, '15355': {'tags': ['trigger', 'avatar'], 'is_for_sale': True, 'built_in': False}, '15867': {'tags': ['stimulator', 'premium_equipment'], 'is_for_sale': True, 'built_in': False}, '16123': {'tags': ['stimulator', 'premium_equipment'], 'is_for_sale': True, 'built_in': False}, '16379': {'tags': ['stimulator', 'premium_equipment'], 'is_for_sale': True, 'built_in': False}, '16635': {'tags': ['stimulator', 'premium_equipment'], 'is_for_sale': True, 'built_in': False}, '16891': {'tags': ['fuel'], 'is_for_sale': True, 'built_in': False}, '17147': {'tags': ['fuel', 'premium_equipment'], 'is_for_sale': True, 'built_in': False}, '230651': {'tags': ['trigger', 'notForSale'], 'is_for_sale': False, 'built_in': False}, '251': {'tags': ['extinguisher', 'perk_affected'], 'is_for_sale': True, 'built_in': False}, '2555': {'tags': ['stimulator', 'premium_equipment'], 'is_for_sale': True, 'built_in': False}, '25851': {'tags': ['stimulator', 'premium_equipment'], 'is_for_sale': True, 'built_in': False}, '26107': {'tags': ['trigger', 'avatar'], 'is_for_sale': True, 'built_in': False}, '26363': {'tags': ['trigger', 'avatar'], 'is_for_sale': True, 'built_in': False}, '3067': {'tags': ['stimulator', 'premium_equipment'], 'is_for_sale': True, 'built_in': False}, '3579': {'tags': ['stimulator', 'premium_equipment'], 'is_for_sale': True, 'built_in': False}, '3835': {'tags': ['trigger', 'notForSale'], 'is_for_sale': False, 'built_in': False}, '4091': {'tags': ['stimulator', 'premium_equipment'], 'is_for_sale': True, 'built_in': False}, '4603': {'tags': ['stimulator', 'premium_equipment'], 'is_for_sale': True, 'built_in': False}, '46075': {'tags': ['regenerationKit', 'notForSale'], 'is_for_sale': False, 'built_in': False}, '46331': {'tags': ['builtin', 'notForSale', 'repairkit', 'perk_affected', 'premium_equipment'], 'is_for_sale': False, 'built_in': True}, '47099': {'tags': ['medkit', 'repairKitBattleRoyale', 'repairkit', 'notForSale'], 'is_for_sale': False, 'built_in': False}, '47867': {'tags': ['trigger', 'notForSale'], 'is_for_sale': False, 'built_in': False}, '4859': {'tags': ['stimulator', 'premium_equipment'], 'is_for_sale': True, 'built_in': False}, '48891': {'tags': ['trigger', 'notForSale'], 'is_for_sale': False, 'built_in': False}, '507': {'tags': ['extinguisher', 'perk_affected', 'premium_equipment'], 'is_for_sale': True, 'built_in': False}, '5376507': {'tags': ['dynComponentsGroup', 'notForRegularSlot', 'LS_equipment', 'notForSale'], 'is_for_sale': False, 'built_in': False}, '5376763': {'tags': ['dynComponentsGroup', 'LS_equipment', 'notForRegularSlot', 'hideIfNotInShop', 'notForSale'], 'is_for_sale': False, 'built_in': False}, '5377019': {'tags': ['dynComponentsGroup', 'notForRegularSlot', 'LS_equipment', 'notForSale'], 'is_for_sale': False, 'built_in': False}, '5377275': {'tags': ['dynComponentsGroup', 'notForRegularSlot', 'LS_equipment', 'notForSale'], 'is_for_sale': False, 'built_in': False}, '5377531': {'tags': ['dynComponentsGroup', 'notForRegularSlot', 'LS_equipment', 'notForSale'], 'is_for_sale': False, 'built_in': False}, '5377787': {'tags': ['dynComponentsGroup', 'notForRegularSlot', 'LS_equipment', 'notForSale'], 'is_for_sale': False, 'built_in': False}, '5378043': {'tags': ['dynComponentsGroup', 'notForRegularSlot', 'LS_equipment', 'notForSale'], 'is_for_sale': False, 'built_in': False}, '5378299': {'tags': ['dynComponentsGroup', 'notForRegularSlot', 'LS_equipment', 'notForSale'], 'is_for_sale': False, 'built_in': False}, '5378555': {'tags': ['dynComponentsGroup', 'notForRegularSlot', 'LS_equipment', 'notForSale'], 'is_for_sale': False, 'built_in': False}, '5378811': {'tags': ['dynComponentsGroup', 'notForRegularSlot', 'LS_equipment', 'notForSale'], 'is_for_sale': False, 'built_in': False}, '5379067': {'tags': ['hideIfNotInShop', 'LS_situational', 'notForRegularSlot', 'notForSale', 'dynComponentsGroup', 'LS_equipment'], 'is_for_sale': False, 'built_in': False}, '5379323': {'tags': ['hideIfNotInShop', 'LS_situational', 'notForRegularSlot', 'notForSale', 'dynComponentsGroup', 'LS_equipment'], 'is_for_sale': False, 'built_in': False}, '5379579': {'tags': ['hideIfNotInShop', 'LS_situational', 'notForRegularSlot', 'notForSale', 'dynComponentsGroup', 'LS_equipment'], 'is_for_sale': False, 'built_in': False}, '5631483': {'tags': ['LS_emptySlot', 'LS_equipment'], 'is_for_sale': True, 'built_in': False}, '5631739': {'tags': ['LS_emptySlot', 'LS_equipment'], 'is_for_sale': True, 'built_in': False}, '5631995': {'tags': ['LS_emptySlot', 'LS_equipment'], 'is_for_sale': True, 'built_in': False}, '763': {'tags': ['medkit', 'perk_affected'], 'is_for_sale': True, 'built_in': False}}, 'status': 'reviewed_reference_not_exact_transaction_or_simulator'}
+MAX_BYTES=8*1024*1024
+RETRY=900
+CHECK_INTERVAL=86400
+ROOTS={'eu':'eu','na':'com','asia':'asia'}
+# Public documented APIs and limited public metadata checks. Tanks.gg has no established bulk interface.
+BASE_SOURCES=dict(REFERENCE['sources'])
+BASE_SOURCES.pop('tanks_gg',None)
+BASE_SOURCES.pop('current_patch',None)
+BASE_SOURCES['client_mirror']='https://raw.githubusercontent.com/IzeBerg/wot-src/EU/.version_name'
+BASE_SOURCES['unicum_specs']='https://unicum.gg/api/eu/tanks/specifications'
+BASE_SOURCES['unicum_changes']='https://unicum.gg/api/eu/tanks/changes'
+BASE_SOURCES['barracks']='https://worldoftanks.eu/en/news/general-news/currency-and-resources/'
+HOSTS={'worldoftanks.eu','worldoftanks.com','worldoftanks.asia','developers.wargaming.net','raw.githubusercontent.com','unicum.gg','api.worldoftanks.eu','api.worldoftanks.com','api.worldoftanks.asia'}
+
+def obj(x):return x if isinstance(x,dict) else {}
+def canonical(x):return json.dumps(x,sort_keys=True,separators=(',',':'),ensure_ascii=True,allow_nan=False).encode('ascii')
+def digest(x):return hashlib.sha256(x).hexdigest()
+def read(path,limit=MAX_BYTES):
+    if path.is_symlink() or not 0<path.stat().st_size<=limit:raise ValueError('Invalid source file')
+    return json.loads(path.read_bytes())
+def safe_url(url):
+    u=urllib.parse.urlsplit(url)
+    if u.scheme!='https' or u.hostname not in HOSTS or u.username or u.password or u.port not in (None,443):raise ValueError('Unapproved source')
+    return url
+class Redirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self,req,fp,code,msg,headers,newurl):
+        safe_url(newurl)
+        if urllib.parse.urlsplit(req.full_url).hostname!=urllib.parse.urlsplit(newurl).hostname:raise ValueError('Cross-host redirect rejected')
+        return super().redirect_request(req,fp,code,msg,headers,newurl)
+def fetch(url):
+    request=urllib.request.Request(safe_url(url),headers={'User-Agent':'WoTQuartermaster/0.6.7 (public game data; no player records)','Accept':'application/json,text/html,text/plain;q=0.9','Cache-Control':'no-cache'})
+    with urllib.request.build_opener(Redirect()).open(request,timeout=8) as f:
+        safe_url(f.geturl());raw=f.read(MAX_BYTES+1)
+    if not raw or len(raw)>MAX_BYTES:raise ValueError('Empty or oversized source')
+    return raw
+
+def source_registry(version,region,app_id=''):
+    if region not in ROOTS:raise ValueError('Unsupported region')
+    domain=ROOTS[region];src={k:v.replace('worldoftanks.eu','worldoftanks.'+domain).replace('/api/eu/','/api/'+region+'/') for k,v in BASE_SOURCES.items()}
+    if region!='eu':src.pop('client_mirror',None)
+    # Official patch index is always checked; unknown version-specific URLs are not invented.
+    if region=='eu' and version==REFERENCE['target_client_build']:src['current_patch']=REFERENCE['sources']['current_patch']
+    if re.fullmatch(r'[a-zA-Z0-9]{16,80}',app_id or ''):
+        # Only a public application identifier and encyclopedia fields, never account ids or access tokens.
+        src['wg_vehicles']='https://api.worldoftanks.'+domain+'/wot/encyclopedia/vehicles/?'+urllib.parse.urlencode({'application_id':app_id,'fields':'tank_id,tier,nation,modules_tree,next_tanks','limit':100,'page_no':1})
+    return src
+
+def native_identity(cat):
+    m=obj(getattr(cat,'manifest',None));version=m.get('game_version');files=obj(m.get('files'))
+    if not version or not files:return None
+    hashes={k:obj(v).get('sha256') for k,v in files.items()}
+    if any(not isinstance(h,str) or not re.fullmatch(r'[a-f0-9]{64}',h) for h in hashes.values()):return None
+    return {'version':version,'hashes':hashes}
+
+@lru_cache(maxsize=16)
+def supplemental_manifest(path,stamp,identity_json):
+    p=Path(path);m=read(p);i=json.loads(identity_json)
+    if m.get('schema')!=1 or m.get('game_version')!=i['version'] or m.get('base_checksums')!=i['hashes'] or m.get('collection_finished') is not True or m.get('status') not in ('complete','partial') or m.get('collector_version') not in ('0.0.10','0.0.11','0.0.12'):
+        raise ValueError('Supplemental identity mismatch')
+    return m
+@lru_cache(maxsize=512)
+def supplemental_record(path,stamp,sha,identity_json,record_key):
+    p=Path(path)
+    if p.is_symlink() or p.stat().st_size>MAX_BYTES:raise ValueError('Unsafe record')
+    raw=p.read_bytes()
+    if digest(raw)!=sha:raise ValueError('Record checksum mismatch')
+    r=json.loads(raw);i=json.loads(identity_json);d=obj(r.get('data'))
+    if r.get('identity')!=i or r.get('category')+':'+str(r.get('key'))!=record_key or r.get('finished') is not True or digest(canonical(d))!=r.get('data_sha256'):raise ValueError('Record identity or payload mismatch')
+    # Strip account/session observations from any static data shared with advisors.
+    return {k:v for k,v in d.items() if k not in ('observed_account_key','observed_session','observed_at')}
+def record(context,category,item_id):
+    try:
+        cat=context.catalogue;i=native_identity(cat)
+        if not i or cat.folder is None:return None
+        folder=Path(cat.folder)/'supplemental-audit-v1';p=folder/'manifest.json'
+        repair=Path(cat.folder)/'supplemental-audit-v2'
+        if repair.is_dir() and not repair.is_symlink() and (repair/'manifest.json').is_file():
+            rp=repair/'manifest.json';rs=rp.stat()
+            try:
+                supplemental_manifest(str(rp),(rs.st_size,rs.st_mtime_ns),canonical(i).decode());folder=repair;p=rp
+            except (OSError,ValueError,KeyError,TypeError,AttributeError):pass
+        if folder.is_symlink() or p.is_symlink():return None
+        s=p.stat();m=supplemental_manifest(str(p),(s.st_size,s.st_mtime_ns),canonical(i).decode())
+        k=category+':'+str(item_id);e=obj(obj(m.get('files')).get(k));filename=e.get('file','')
+        if not re.fullmatch(r'[a-zA-Z0-9_-]+\.json',filename) or not re.fullmatch(r'[a-f0-9]{64}',str(e.get('sha256'))):return None
+        p=folder/filename;s=p.stat();ident={'schema':m['schema'],'collector_version':m['collector_version'],'game_version':m['game_version'],'base_checksums':m['base_checksums']}
+        d=supplemental_record(str(p),(s.st_size,s.st_mtime_ns),e['sha256'],canonical(ident).decode(),k)
+        if category=='vehicle' and (str(d.get('vehicle_id'))!=str(item_id) or d.get('scope')!='isolated_stock_preview' or d.get('fit_scope')!='stock_preview_only_not_purchase_eligibility'):return None
+        return d
+    except (OSError,ValueError,KeyError,TypeError,AttributeError):return None
+
+def reference(context):
+    i=native_identity(context.catalogue)
+    if not i or i['version']!=REFERENCE['target_client_build']:return None
+    # The curated reference is bound to the exact native catalogue hashes, not merely a matching version name.
+    if i['hashes']!=REFERENCE['base_checksums']:return None
+    return REFERENCE
+
+def safe_config(root):
+    try:c=read(root/'settings.json',16384)
+    except (OSError,ValueError):c={}
+    region=c.get('region','eu');return (region if region in ROOTS else 'eu',str(c.get('wg_application_id','')))
+
+def refresh_sources(root,identity,region,app_id='',getter=fetch,now=None,force=False):
+    now=time.time() if now is None else now
+    ident={'schema':1,'native':identity,'region':region,'manager_version':MODULE['version']}
+    key=digest(canonical(ident));folder=root/'generations'/key;folder.mkdir(parents=True,exist_ok=True)
+    if root.is_symlink() or folder.is_symlink() or not folder.resolve().is_relative_to(root.resolve()):raise ValueError('Unsafe data folder')
+    state_path=folder/'status.json'
+    try:state=read(state_path)
+    except (OSError,ValueError):state={}
+    if state.get('identity')!=ident:state={'identity':ident,'sources':{}}
+    status=obj(state.get('sources'));registry=source_registry(identity['version'],region,app_id)
+    # Keep an independently retriable check for each source. Do not mark a failed check as a successful refresh.
+    for name,url in registry.items():
+        prev=obj(status.get(name));is_good=prev.get('state') in ('checked','provisional')
+        if not force and now-prev.get('attempted_at',0)<(CHECK_INTERVAL if is_good else RETRY) :continue
+        try:
+            raw=getter(url);h=digest(raw)
+            entry={'attempted_at':now,'checked_at':now,'sha256':h,'changed':bool(prev.get('sha256') and prev.get('sha256')!=h),'state':'checked','verification':'document/source checked; semantic review required'}
+            if name in ('unicum_specs','unicum_changes','wg_vehicles'):
+                data=json.loads(raw);rows=data.get('results') if name=='unicum_specs' else data.get('versions') if name=='unicum_changes' else data.get('data')
+                if not isinstance(rows,(list,dict)) or not rows or (name=='wg_vehicles' and data.get('status')!='ok'):raise ValueError('Invalid public API response')
+                if name=='unicum_specs':
+                    if not isinstance(rows,list) or any(not isinstance(x,dict) or type(obj(x.get('identity')).get('tankId')) is not int or not isinstance(x.get('specifications'),dict) for x in rows):raise ValueError('Invalid specifications schema')
+                    ids=[x['identity']['tankId'] for x in rows]
+                    if len(ids)!=len(set(ids)):raise ValueError('Duplicate vehicle IDs')
+                # Save only candidate public data. Exact client/configuration provenance is not established.
+                atomic_bytes(folder/(name+'-'+h+'.json'),raw);entry.update(state='provisional',verification='Public API observation; exact client/configuration not established',rows=len(rows))
+            elif name=='client_mirror':
+                version=raw.decode('utf-8').strip();entry.update(verification='Exact mirror build matches' if version==identity['version'] else 'Mirror build differs',mirror_version=version)
+                if version!=identity['version']:entry['state']='provisional'
+            status[name]=entry
+        except Exception as exc:
+            # Do not persist exception messages that may contain a configured API key.
+            status[name]=dict(prev,state='retry',attempted_at=now,error=type(exc).__name__)
+        state['sources']=status;atomic_bytes(state_path,canonical(state))
+    if 'wg_vehicles' not in registry:status['wg_vehicles']={'state':'blocked','verification':'Registered Wargaming application ID required'}
+    status['tanks_gg']={'state':'blocked','verification':'No approved machine data interface; no scraping'}
+    state['sources']=status;state['updated_at']=now
+    atomic_bytes(state_path,canonical(state))
+    # This is an observation pointer, never permission to use stale data as current.
+    atomic_bytes(root/'current.json',canonical({'identity':ident,'generation':key,'status':'checked_with_limitations'}))
+    return state
+
+def make_page(w):
+    p=QWidget();lay=QVBoxLayout(p);heading(lay,'Data Manager','Version-aware native and external sources. All online requests are for public game data only.')
+    w.dm_summary=label('Waiting for a matching game catalogue.',wrap=True);lay.addWidget(w.dm_summary)
+    w.dm_details=label('',wrap=True);lay.addWidget(w.dm_details)
+    w.dm_details.setTextFormat(Qt.TextFormat.PlainText)
+    b=QPushButton('Check sources now');b.clicked.connect(lambda:refresh(w,True,manual=True));lay.addWidget(b);lay.addStretch(1);w.add_page('Data Manager',p)
+def refresh(w,force=False,manual=False):
+    # Called on the GUI thread. Network and file writes are exclusively in a separate worker.
+    if not hasattr(w,'dm_summary') or not getattr(w,'model',None):return
+    m=w.model;root=Path(m.root)/'data_manager';i=native_identity(m.garage_data.catalogue)
+    if not i or m.state not in ('garage','closed','stale'):return
+    key=(str(root.resolve()),digest(canonical(i)));job=getattr(w,'dm_job',None)
+    if job and not job.is_alive():w.dm_job=None
+    if getattr(w,'dm_result',None):
+        result_key,state=w.dm_result;w.dm_result=None
+        if result_key==key:
+            w.dm_summary.setText(i['version']+' · '+str(len(REFERENCE['active_perks']))+' reviewed perk identities in the reference pack' if i['version']==REFERENCE['target_client_build'] else i['version']+' · reference pack requires review')
+            w.dm_details.setText('\n'.join(k+': '+str(v.get('state'))+' — '+str(v.get('verification',v.get('error',''))) for k,v in sorted(obj(state.get('sources')).items())))
+    if getattr(w,'dm_job',None):return
+    if not manual and getattr(w,'dm_key',None)==key and time.monotonic()<getattr(w,'dm_next',0):return
+    w.dm_key=key;w.dm_next=time.monotonic()+60;w.dm_summary.setText(i['version']+' · Checking source status…')
+    def work():
+        try:
+            region,app=safe_config(root);state=refresh_sources(root,i,region,app,force=manual)
+        except Exception as exc:state={'sources':{'manager':{'state':'retry','error':type(exc).__name__}}}
+        w.dm_result=(key,state)
+    w.dm_job=threading.Thread(target=work,name='Quartermaster public data sources',daemon=True);w.dm_job.start()
+def reset(w):
+    w.dm_key=None;w.dm_next=0
+
+def register():
+    return {'services':{'native_stock_preview':lambda context,vehicle_id:record(context,'vehicle',vehicle_id),'reviewed_data_reference':reference,'native_supplemental_record':record},'pages':[{'name':'Data Manager','order':75,'build':make_page}],'hooks':{'refresh':refresh,'reset':reset}}
